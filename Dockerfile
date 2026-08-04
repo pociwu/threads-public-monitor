@@ -8,12 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     ca-certificates \
+    fluxbox \
     fonts-noto-cjk \
     novnc \
     sqlite3 \
     tini \
     websockify \
     x11vnc \
+    x11-utils \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,4 +30,3 @@ RUN pip install . && chmod +x /app/scripts/*.sh
 ENV CHROMIUM_EXECUTABLE=/usr/bin/chromium
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
-
