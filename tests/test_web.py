@@ -5,7 +5,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account, Job
+from app.models import Account, CollectionStream, Job
 
 
 def make_client() -> tuple[TestClient, Session]:
@@ -75,6 +75,42 @@ def test_account_trend_is_collapsible() -> None:
         assert response.status_code == 200
         assert '<details class="chart-panel collapsible-panel">' in response.text
         assert "危險操作（永久刪除資料）" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_account_detail_lists_completed_and_pending_backfill_streams() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        db.add_all(
+            [
+                CollectionStream(
+                    account_id=account.id,
+                    content_type="post",
+                    phase="incremental",
+                    collected_count=7,
+                ),
+                CollectionStream(
+                    account_id=account.id,
+                    content_type="reply",
+                    phase="backfill",
+                    collected_count=18,
+                ),
+            ]
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}")
+
+        assert response.status_code == 200
+        assert "已回補清單" in response.text
+        assert "尚未回補清單" in response.text
+        assert "7 筆" in response.text
+        assert "18 / 100" in response.text
     finally:
         app.dependency_overrides.clear()
         db.close()

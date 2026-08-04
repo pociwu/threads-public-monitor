@@ -109,6 +109,34 @@ def _account_cards(db: Session) -> list[dict]:
     return cards
 
 
+def _stream_views(account: Account) -> list[dict]:
+    labels = {
+        "post": "串文",
+        "reply": "回覆",
+        "repost": "轉發",
+        "quote": "引用轉發",
+    }
+    streams = {stream.content_type: stream for stream in account.streams}
+    views = []
+    for content_type, label in labels.items():
+        stream = streams.get(content_type)
+        collected_count = stream.collected_count if stream else 0
+        completed = bool(stream and stream.phase == "incremental")
+        views.append(
+            {
+                "content_type": content_type,
+                "label": label,
+                "stream": stream,
+                "collected_count": collected_count,
+                "completed": completed,
+                "progress": 100
+                if completed
+                else round(min(collected_count, settings.backfill_limit) / settings.backfill_limit * 100),
+            }
+        )
+    return views
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db), error: str | None = None):
     usage = media_usage_bytes(db)
@@ -320,6 +348,8 @@ def account_detail(
             "content_views": content_views,
             "runs": runs,
             "chart_data": chart_data,
+            "stream_views": _stream_views(account),
+            "backfill_limit": settings.backfill_limit,
             "avatar_url": f"/media/{account.avatar.local_path}"
             if account.avatar and account.avatar.local_path
             else None,

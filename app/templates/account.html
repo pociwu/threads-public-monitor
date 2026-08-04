@@ -20,6 +20,29 @@
   <div class="chart-content"><canvas id="stats-chart" data-chart='{{ chart_data|safe }}' height="90"></canvas></div>
 </details>
 
+<details class="profile-panel" open>
+  <summary><strong>回補清單</strong></summary>
+  <p class="muted">點擊分類可查看目前已保存的內容；尚未發現的貼文無法預先列出網址。</p>
+  {% set completed_streams = stream_views|selectattr('completed')|list %}
+  {% set pending_streams = stream_views|rejectattr('completed')|list %}
+  <h3>已回補清單</h3>
+  <div class="run-list">
+    {% for item in completed_streams %}
+    <a class="run-row" href="/accounts/{{ account.id }}?tab={{ item.content_type }}">
+      <span class="status status-succeeded">已完成</span><strong>{{ item.label }}</strong><span>{{ item.collected_count }} 筆</span><time>{{ item.stream.last_collected_at|localtime }}</time>
+    </a>
+    {% else %}<div class="empty-state small">目前尚無完成的分類</div>{% endfor %}
+  </div>
+  <h3>尚未回補清單</h3>
+  <div class="run-list">
+    {% for item in pending_streams %}
+    <a class="run-row" href="/accounts/{{ account.id }}?tab={{ item.content_type }}">
+      <span class="status status-queued">{{ '回補中' if item.collected_count else '尚未開始' }}</span><strong>{{ item.label }}</strong><span>{{ item.collected_count }} / {{ backfill_limit }}</span><time>{% if item.stream %}{{ item.stream.last_collected_at|localtime }}{% else %}尚未{% endif %}</time>
+    </a>
+    {% else %}<div class="empty-state small">四個分類皆已完成初始回補</div>{% endfor %}
+  </div>
+</details>
+
 <nav class="tabs">
   {% for key,label in [('all','全部'),('post','串文'),('reply','回覆'),('repost','轉發'),('quote','引用轉發'),('media','影音'),('runs','擷取紀錄')] %}
   <a class="{{ 'active' if tab == key else '' }}" href="/accounts/{{ account.id }}?tab={{ key }}">{{ label }}</a>
