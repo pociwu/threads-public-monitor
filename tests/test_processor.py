@@ -163,6 +163,38 @@ def test_content_job_saves_version_and_changed_metrics(tmp_path) -> None:
         assert metrics.like_count == 3
 
 
+def test_content_success_does_not_replace_last_scheduled_profile_visit(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    profile_success = datetime(2026, 8, 4, 18, 45)
+    next_visit = datetime(2026, 8, 5, 6, 57)
+    with make_session() as db:
+        account = Account(
+            username="example",
+            status="active",
+            last_success_at=profile_success,
+            next_due_at=next_visit,
+        )
+        db.add(account)
+        db.flush()
+        db.add(CollectionStream(account_id=account.id, content_type="post"))
+        job = Job(account_id=account.id, kind="content", content_type="post", status="running")
+        db.add(job)
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", FakeCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert account.last_success_at == profile_success
+        assert account.next_due_at == next_visit
+
+
 def relationship_batch(*usernames: str, complete: bool = True) -> RelationshipBatch:
     return RelationshipBatch(
         members=[

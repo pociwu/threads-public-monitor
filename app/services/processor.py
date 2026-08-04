@@ -497,7 +497,8 @@ class JobProcessor:
         run.status = "succeeded"
         run.finished_at = now
         account.last_attempt_at = now
-        account.last_success_at = now
+        if job.kind in {"verify", "profile"}:
+            account.last_success_at = now
         account.consecutive_failures = 0
         if account.status not in {"pending", "login_required"}:
             account.status = "active"

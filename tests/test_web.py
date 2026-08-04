@@ -42,6 +42,7 @@ def test_dashboard_and_add_account() -> None:
         account = db.scalar(select(Account).where(Account.username == "sin_9311"))
         assert account is not None
         assert account.status == "pending"
+        assert "最後拜訪" in client.get("/").text
     finally:
         app.dependency_overrides.clear()
         db.close()

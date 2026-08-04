@@ -54,7 +54,7 @@
       <div class="progress-copy"><span>初始回補</span><span>{{ item.progress }}%</span></div>
       <div class="progress"><i style="width: {{ item.progress }}%"></i></div>
       <dl class="timing">
-        <div><dt>最後成功</dt><dd>{{ account.last_success_at|localtime }}</dd></div>
+        <div><dt>最後拜訪</dt><dd>{{ account.last_success_at|localtime }}</dd></div>
         <div><dt>下次拜訪</dt><dd>{{ account.next_due_at|localtime }}</dd></div>
       </dl>
       {% if account.status_message %}<p class="status-message">{{ account.status_message }}</p>{% endif %}

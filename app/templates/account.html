@@ -11,7 +11,7 @@
   </div>
   {% if account.bio %}<p class="bio">{{ account.bio }}</p>{% endif %}
   {% if account.external_url %}<a class="profile-link" href="{{ account.external_url }}" target="_blank" rel="noreferrer">{{ account.external_url }}</a>{% endif %}
-  <div class="profile-stats"><a href="/accounts/{{ account.id }}?tab=followers"><strong>{{ account.follower_count|number }}</strong><span>粉絲 · 查看名單</span></a><a href="/accounts/{{ account.id }}?tab=following"><strong>{{ account.following_count|number }}</strong><span>追蹤中 · 查看名單</span></a><div><strong>{{ account.last_success_at|localtime }}</strong><span>最後成功</span></div></div>
+  <div class="profile-stats"><a href="/accounts/{{ account.id }}?tab=followers"><strong>{{ account.follower_count|number }}</strong><span>粉絲 · 查看名單</span></a><a href="/accounts/{{ account.id }}?tab=following"><strong>{{ account.following_count|number }}</strong><span>追蹤中 · 查看名單</span></a><div><strong>{{ account.last_success_at|localtime }}</strong><span>最後拜訪</span></div></div>
   <form class="interval-form" method="post" action="/accounts/{{ account.id }}/interval"><label>拜訪週期<select name="interval_hours" onchange="this.form.submit()">{% for h in [6,12,24] %}<option value="{{ h }}" {{ 'selected' if account.interval_hours == h else '' }}>{{ h }} 小時</option>{% endfor %}</select></label></form>
 </section>
 
