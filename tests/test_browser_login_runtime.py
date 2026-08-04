@@ -3,17 +3,22 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
-def test_login_image_includes_x11_window_manager_and_probe() -> None:
+def test_login_image_uses_native_vnc_x_server_and_window_manager() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "tigervnc-standalone-server" in dockerfile
     assert "fluxbox" in dockerfile
     assert "x11-utils" in dockerfile
+    assert "x11vnc" not in dockerfile
 
 
-def test_login_entrypoint_waits_for_x_and_forces_vnc_repaint() -> None:
+def test_login_entrypoint_waits_for_native_vnc_x_server() -> None:
     entrypoint = (ROOT / "scripts/browser-login-entrypoint.sh").read_text(encoding="utf-8")
+    assert "Xtigervnc :99" in entrypoint
+    assert "-rfbport 5900" in entrypoint
+    assert "-SecurityTypes None" in entrypoint
     assert "xdpyinfo -display :99" in entrypoint
     assert "fluxbox" in entrypoint
-    assert "-noxdamage" in entrypoint
+    assert "x11vnc" not in entrypoint
     assert "--ozone-platform=x11" in entrypoint
 
 

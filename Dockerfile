@@ -13,10 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     novnc \
     sqlite3 \
     tini \
+    tigervnc-standalone-server \
     websockify \
-    x11vnc \
     x11-utils \
-    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

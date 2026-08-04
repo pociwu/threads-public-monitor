@@ -19,3 +19,5 @@ jobs:
       - run: pytest
       - run: cp .env.example .env
       - run: docker compose config --quiet
+      - run: docker build -t threads-public-monitor:test .
+      - run: docker run --rm --entrypoint sh threads-public-monitor:test -c 'command -v Xtigervnc && command -v websockify'
