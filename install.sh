@@ -25,7 +25,9 @@ if [[ ! -f .env ]]; then
   fi
 fi
 
-source .env
+source scripts/env.sh
+TAILSCALE_IP="$(read_env_value .env TAILSCALE_IP 100.120.200.116)"
+WEB_PORT="$(read_env_value .env WEB_PORT 8080)"
 if ! ip -4 addr show | grep -Fq "$TAILSCALE_IP"; then
   echo "設定的 Tailscale IP ${TAILSCALE_IP} 不在此主機上，請修正 .env。" >&2
   exit 1
@@ -35,6 +37,5 @@ docker compose build
 docker compose run --rm web alembic upgrade head
 docker compose up -d web worker
 
-echo "安裝完成：http://${TAILSCALE_IP}:${WEB_PORT:-8080}"
+echo "安裝完成：http://${TAILSCALE_IP}:${WEB_PORT}"
 echo "首次擷取前請執行：bash scripts/login.sh"
-
