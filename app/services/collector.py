@@ -145,7 +145,7 @@ class ThreadsCollector:
         page = self._page(f"https://www.threads.com/@{username}")
         try:
             raw: dict[str, Any] = page.evaluate(
-                """(username) => {
+                r"""(username) => {
                     const body = document.body.innerText || '';
                     const headings = [...document.querySelectorAll('h1')]
                       .map(e => e.textContent?.trim()).filter(Boolean);
@@ -154,8 +154,12 @@ class ThreadsCollector:
                       ((img.alt || '').includes('大頭貼') || (img.alt || '').toLowerCase().includes('profile'))
                     );
                     const links = [...document.querySelectorAll('a')];
-                    const follower = links.find(a => /粉絲|followers?/i.test(a.textContent || ''));
-                    const following = links.find(a => /追蹤中|following/i.test(a.textContent || ''));
+                    const controls = [...document.querySelectorAll('a,button,[role="button"]')]
+                      .map(el => [el.getAttribute('aria-label') || '', el.textContent || '']
+                        .join(' ').replace(/\s+/g, ' ').trim())
+                      .filter(text => text.length < 240);
+                    const follower = controls.find(text => /粉絲|followers?/i.test(text));
+                    const following = controls.find(text => /追蹤中|following/i.test(text));
                     const external = links.find(a => {
                       try { return new URL(a.href).hostname !== 'www.threads.com' &&
                         !new URL(a.href).hostname.endsWith('threads.com'); } catch { return false; }
@@ -165,8 +169,8 @@ class ThreadsCollector:
                       body,
                       headings,
                       avatarUrl: avatar?.currentSrc || avatar?.src || null,
-                      followerText: follower?.textContent || null,
-                      followingText: following?.textContent || null,
+                      followerText: follower || null,
+                      followingText: following || null,
                       externalUrl: external?.href || null,
                       profileText: profileRoot?.innerText || ''
                     };
@@ -238,7 +242,9 @@ class ThreadsCollector:
                       root = root.parentElement;
                       if (root.querySelectorAll('button').length >= 3 && root.innerText.length > 10) break;
                     }
-                    const text = root.innerText || '';
+                    const textRoot = root.cloneNode(true);
+                    textRoot.querySelectorAll('button,time').forEach(el => el.remove());
+                    const text = textRoot.innerText || textRoot.textContent || '';
                     const authorLink = root.querySelector('a[href^="/@"]');
                     const time = root.querySelector('time');
                     const media = [...root.querySelectorAll('img,video')].map(el => ({
@@ -246,7 +252,10 @@ class ThreadsCollector:
                       type: el.tagName === 'VIDEO' ? 'video' : 'image',
                       alt: el.alt || ''
                     })).filter(m => m.url && !/profile|大頭貼/i.test(m.alt));
-                    const buttons = [...root.querySelectorAll('button')].map(b => b.innerText || b.getAttribute('aria-label') || '');
+                    const buttons = [...root.querySelectorAll('button')].map(b => ({
+                      text: b.innerText || '',
+                      label: b.getAttribute('aria-label') || ''
+                    }));
                     const postIds = [...root.querySelectorAll('a[href*="/post/"]')]
                       .map(a => ((a.href.match(/\/post\/([^/?#]+)/) || [])[1])).filter(Boolean);
                     seen.add(id);
@@ -307,13 +316,21 @@ class ThreadsCollector:
         ignored = re.compile(
             r"^(讚|留言|轉發|分享|翻譯|like|reply|repost|share)(\s+[\d,.萬千KkMm]+)?$", re.I
         )
-        kept = [
-            line for line in lines if line.lower() != author.lower() and not ignored.match(line)
+        date_or_separator = re.compile(r"^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|/)$")
+        numeric = re.compile(r"^[\d,.]+\s*[萬万千KkMm]?(?:\s*次)?$")
+        candidates = [
+            line
+            for line in lines
+            if line.lower() != author.lower()
+            and not ignored.match(line)
+            and not date_or_separator.match(line)
         ]
+        has_text = any(not numeric.match(line) for line in candidates)
+        kept = [line for line in candidates if not has_text or not numeric.match(line)]
         return "\n".join(kept)[:20_000] or None
 
     @staticmethod
-    def _button_counts(buttons: list[str]) -> dict[str, int | None]:
+    def _button_counts(buttons: list[dict[str, str] | str]) -> dict[str, int | None]:
         result = {
             "like_count": None,
             "reply_count": None,
@@ -327,9 +344,16 @@ class ThreadsCollector:
             "share_count": re.compile(r"分享|share", re.I),
         }
         for button in buttons:
+            if isinstance(button, dict):
+                text = button.get("text", "")
+                label = button.get("label", "")
+                descriptor = f"{label} {text}".strip()
+            else:
+                text = button
+                descriptor = button
             for key, pattern in mapping.items():
-                if pattern.search(button):
-                    result[key] = parse_count(button)
+                if pattern.search(descriptor):
+                    result[key] = parse_count(text) or parse_count(descriptor)
         return result
 
 

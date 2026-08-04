@@ -37,6 +37,26 @@ def test_content_fingerprint_is_order_independent_for_media() -> None:
     assert first != content_fingerprint("changed", ["a", "b"])
 
 
+def test_content_text_excludes_trailing_threads_ui_numbers() -> None:
+    raw = "example\n2026-6-10\n杜拜巧克力＝杜力\n1\n/\n2\n12 萬\n731\n4,014\n2.3 萬"
+    assert ThreadsCollector._clean_content_text(raw, "example") == "杜拜巧克力＝杜力"
+
+
+def test_interaction_counts_pair_button_text_with_accessible_labels() -> None:
+    controls = [
+        {"text": "6,601", "label": "讚 6,601 次"},
+        {"text": "322", "label": "322 則回覆"},
+        {"text": "352", "label": "轉發 352 次"},
+        {"text": "803", "label": "分享 803 次"},
+    ]
+    assert ThreadsCollector._button_counts(controls) == {
+        "like_count": 6601,
+        "reply_count": 322,
+        "repost_count": 352,
+        "share_count": 803,
+    }
+
+
 def test_collector_stops_playwright_when_browser_launch_fails(monkeypatch, tmp_path) -> None:
     class FailingChromium:
         def launch_persistent_context(self, *_args, **_kwargs):
