@@ -79,17 +79,29 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const canvas = document.querySelector("#stats-chart");
   if (canvas && window.Chart) {
-    const data = JSON.parse(canvas.dataset.chart);
-    new Chart(canvas, {
-      type: "line",
-      data: {
-        labels: data.labels,
-        datasets: [
-          {label: "粉絲", data: data.followers, borderColor: "#7c5cff", backgroundColor: "#7c5cff22", tension: 0.3, spanGaps: true},
-          {label: "追蹤中", data: data.following, borderColor: "#2dd4bf", backgroundColor: "#2dd4bf22", tension: 0.3, spanGaps: true},
-        ],
-      },
-      options: {responsive: true, plugins: {legend: {labels: {color: "#b8b5c8"}}}, scales: {x: {ticks: {color: "#777487", maxTicksLimit: 8}, grid: {color: "#292733"}}, y: {ticks: {color: "#777487"}, grid: {color: "#292733"}}}},
-    });
+    const renderChart = () => {
+      if (canvas.dataset.chartInitialized) return;
+      canvas.dataset.chartInitialized = "true";
+      const data = JSON.parse(canvas.dataset.chart);
+      new Chart(canvas, {
+        type: "line",
+        data: {
+          labels: data.labels,
+          datasets: [
+            {label: "粉絲", data: data.followers, borderColor: "#7c5cff", backgroundColor: "#7c5cff22", tension: 0.3, spanGaps: true},
+            {label: "追蹤中", data: data.following, borderColor: "#2dd4bf", backgroundColor: "#2dd4bf22", tension: 0.3, spanGaps: true},
+          ],
+        },
+        options: {responsive: true, plugins: {legend: {labels: {color: "#b8b5c8"}}}, scales: {x: {ticks: {color: "#777487", maxTicksLimit: 8}, grid: {color: "#292733"}}, y: {ticks: {color: "#777487"}, grid: {color: "#292733"}}}},
+      });
+    };
+    const panel = canvas.closest("details");
+    if (panel && !panel.open) {
+      panel.addEventListener("toggle", () => {
+        if (panel.open) renderChart();
+      });
+    } else {
+      renderChart();
+    }
   }
 });

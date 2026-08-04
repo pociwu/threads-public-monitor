@@ -1,7 +1,12 @@
 import pytest
 
 from app.config import Settings
-from app.services.collector import ThreadsCollector, content_fingerprint, parse_count
+from app.services.collector import (
+    ThreadsCollector,
+    content_fingerprint,
+    parse_count,
+    parse_labeled_count,
+)
 
 
 @pytest.mark.parametrize(
@@ -17,6 +22,12 @@ from app.services.collector import ThreadsCollector, content_fingerprint, parse_
 )
 def test_parse_count(value: str | None, expected: int | None) -> None:
     assert parse_count(value) == expected
+
+
+def test_parse_labeled_count_falls_back_to_visible_profile_text() -> None:
+    body = "顯示名稱\n1.2萬位粉絲\n個人簡介"
+    assert parse_labeled_count(None, body, r"粉絲|followers?") == 12_000
+    assert parse_labeled_count(None, body, r"追蹤中|following") is None
 
 
 def test_content_fingerprint_is_order_independent_for_media() -> None:

@@ -15,7 +15,10 @@
   <form class="interval-form" method="post" action="/accounts/{{ account.id }}/interval"><label>拜訪週期<select name="interval_hours" onchange="this.form.submit()">{% for h in [6,12,24] %}<option value="{{ h }}" {{ 'selected' if account.interval_hours == h else '' }}>{{ h }} 小時</option>{% endfor %}</select></label></form>
 </section>
 
-<section class="chart-panel"><div class="section-heading"><h2>帳號趨勢</h2><span class="muted">未知值不以 0 呈現</span></div><canvas id="stats-chart" data-chart='{{ chart_data|safe }}' height="90"></canvas></section>
+<details class="chart-panel collapsible-panel">
+  <summary class="section-heading"><h2>帳號趨勢</h2><span class="muted">未知值不以 0 呈現 · 點擊展開</span></summary>
+  <div class="chart-content"><canvas id="stats-chart" data-chart='{{ chart_data|safe }}' height="90"></canvas></div>
+</details>
 
 <nav class="tabs">
   {% for key,label in [('all','全部'),('post','串文'),('reply','回覆'),('repost','轉發'),('quote','引用轉發'),('media','影音'),('runs','擷取紀錄')] %}
@@ -41,6 +44,5 @@
 <div class="pagination">{% if page > 1 %}<a class="button ghost" href="?tab={{ tab }}&page={{ page-1 }}">上一頁</a>{% endif %}{% if has_next %}<a class="button ghost" href="?tab={{ tab }}&page={{ page+1 }}">下一頁</a>{% endif %}</div>
 {% endif %}
 
-<details class="danger-zone"><summary>危險操作</summary><h2>永久刪除帳號資料</h2><p>輸入 <code>{{ account.username }}</code> 確認。此操作會刪除歷史資料，且清除不再被引用的媒體。</p><form method="post" action="/accounts/{{ account.id }}/delete" data-confirm="永久刪除 @{{ account.username }} 的所有資料？"><input name="confirmation" required autocomplete="off"><button class="button danger" type="submit">永久刪除</button></form></details>
+<details class="danger-zone"><summary>危險操作（永久刪除資料）</summary><h2>永久刪除帳號資料</h2><p>若只想暫停，請回首頁使用「停止監看」。此處會刪除帳號、歷史紀錄及不再被引用的媒體，無法復原。輸入 <code>{{ account.username }}</code> 確認。</p><form method="post" action="/accounts/{{ account.id }}/delete" data-confirm="永久刪除 @{{ account.username }} 的所有資料？"><input name="confirmation" required autocomplete="off"><button class="button danger" type="submit">永久刪除</button></form></details>
 {% endblock %}
-

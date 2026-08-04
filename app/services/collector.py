@@ -70,6 +70,20 @@ def parse_count(value: str | None) -> int | None:
     return int(number * multiplier)
 
 
+def parse_labeled_count(
+    primary: str | None, fallback_text: str | None, label_pattern: str
+) -> int | None:
+    primary_count = parse_count(primary)
+    if primary_count is not None:
+        return primary_count
+    for line in (fallback_text or "").splitlines():
+        if re.search(label_pattern, line, re.I):
+            count = parse_count(line)
+            if count is not None:
+                return count
+    return None
+
+
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -183,8 +197,12 @@ class ThreadsCollector:
                 bio="\n".join(bio_lines[:4]) or None,
                 external_url=raw.get("externalUrl"),
                 avatar_url=raw.get("avatarUrl"),
-                follower_count=parse_count(raw.get("followerText")),
-                following_count=parse_count(raw.get("followingText")),
+                follower_count=parse_labeled_count(
+                    raw.get("followerText"), body, r"粉絲|followers?"
+                ),
+                following_count=parse_labeled_count(
+                    raw.get("followingText"), body, r"追蹤中|following"
+                ),
             )
         finally:
             page.close()

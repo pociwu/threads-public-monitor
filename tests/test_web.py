@@ -63,6 +63,23 @@ def test_reorder_accounts_persists_order() -> None:
         db.close()
 
 
+def test_account_trend_is_collapsible() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}")
+
+        assert response.status_code == 200
+        assert '<details class="chart-panel collapsible-panel">' in response.text
+        assert "危險操作（永久刪除資料）" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
 def test_retry_moves_login_required_account_back_to_pending() -> None:
     client, db = make_client()
     try:
