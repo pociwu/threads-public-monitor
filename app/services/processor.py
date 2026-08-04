@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -16,6 +16,10 @@ from app.models import (
     InteractionSnapshot,
     Job,
     ProfileVersion,
+    RelationshipChange,
+    RelationshipMember,
+    RelationshipScan,
+    RelationshipScanMember,
     StatSnapshot,
 )
 from app.services.collector import (
@@ -23,6 +27,7 @@ from app.services.collector import (
     ContentData,
     LoginRequired,
     ProfileData,
+    RelationshipBatch,
     ThreadsCollector,
     content_fingerprint,
 )
@@ -30,6 +35,7 @@ from app.services.media import MediaStore
 from app.services.queue import enqueue_unique, next_account_due, next_batch_time, now_utc
 
 STREAM_TYPES = ("post", "reply", "repost", "quote")
+RELATIONSHIP_TYPES = ("followers", "following")
 
 
 class JobProcessor:
@@ -54,6 +60,7 @@ class JobProcessor:
                 if job.kind in {"verify", "profile"}:
                     profile = collector.collect_profile(account.username)
                     self._save_profile(db, account, profile)
+                    self._schedule_relationship_scans(db, account)
                     self._schedule_stream(db, account)
                     run.item_count = 1
                 elif job.kind == "content" and job.content_type in STREAM_TYPES:
@@ -70,9 +77,32 @@ class JobProcessor:
                         cursor=stream.cursor if stream and stream.phase == "backfill" else None,
                     )
                     run.item_count = self._save_content_batch(db, account, job.content_type, items)
+                elif job.kind == "relationship" and job.content_type in RELATIONSHIP_TYPES:
+                    scan = self._current_relationship_scan(db, account, job.content_type)
+                    if not scan:
+                        raise CollectionError("找不到可執行的關係名單掃描")
+                    batch = collector.collect_relationships(
+                        account.username,
+                        job.content_type,
+                        self.settings.relationship_batch_size,
+                        cursor=scan.cursor,
+                    )
+                    run.item_count = self._save_relationship_batch(db, account, scan, batch)
                 else:
                     raise CollectionError(f"未知工作類型：{job.kind}")
             self._success(db, account, job, run)
+            if job.kind == "relationship" and job.content_type in RELATIONSHIP_TYPES:
+                db.flush()
+                scan = self._current_relationship_scan(db, account, job.content_type)
+                if scan and scan.status == "running":
+                    enqueue_unique(
+                        db,
+                        kind="relationship",
+                        account_id=account.id,
+                        content_type=job.content_type,
+                        priority=40,
+                        not_before=next_batch_time(self.settings),
+                    )
         except LoginRequired as exc:
             self._failure(db, job, run, exc, login_required=True)
         except Exception as exc:
@@ -148,6 +178,184 @@ class JobProcessor:
             if not stream:
                 db.add(CollectionStream(account_id=account.id, content_type=stream_type))
         db.flush()
+
+    def _schedule_relationship_scans(self, db: Session, account: Account) -> None:
+        scan_date = datetime.now(self.settings.tz).date()
+        for relationship_type in RELATIONSHIP_TYPES:
+            scan = db.scalar(
+                select(RelationshipScan).where(
+                    RelationshipScan.account_id == account.id,
+                    RelationshipScan.relationship_type == relationship_type,
+                    RelationshipScan.scan_date == scan_date,
+                )
+            )
+            if scan is None:
+                scan = RelationshipScan(
+                    account_id=account.id,
+                    relationship_type=relationship_type,
+                    scan_date=scan_date,
+                    status="running",
+                )
+                db.add(scan)
+                db.flush()
+            if scan.status == "running":
+                enqueue_unique(
+                    db,
+                    kind="relationship",
+                    account_id=account.id,
+                    content_type=relationship_type,
+                    priority=40,
+                    not_before=next_batch_time(self.settings),
+                )
+
+    @staticmethod
+    def _current_relationship_scan(
+        db: Session, account: Account, relationship_type: str
+    ) -> RelationshipScan | None:
+        return db.scalar(
+            select(RelationshipScan)
+            .where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == relationship_type,
+                RelationshipScan.status == "running",
+            )
+            .order_by(RelationshipScan.scan_date, RelationshipScan.id)
+            .limit(1)
+        )
+
+    def _save_relationship_batch(
+        self,
+        db: Session,
+        account: Account,
+        scan: RelationshipScan,
+        batch: RelationshipBatch,
+    ) -> int:
+        now = now_utc()
+        saved = 0
+        for item in batch.members:
+            avatar_id = None
+            member = db.scalar(
+                select(RelationshipMember).where(
+                    RelationshipMember.account_id == account.id,
+                    RelationshipMember.relationship_type == scan.relationship_type,
+                    RelationshipMember.username == item.username,
+                )
+            )
+            if item.avatar_url:
+                avatar = self.media.register(db, item.avatar_url, "image")
+                self.media.download(db, avatar)
+                avatar_id = avatar.id
+            if member is None:
+                member = RelationshipMember(
+                    account_id=account.id,
+                    relationship_type=scan.relationship_type,
+                    username=item.username,
+                    display_name=item.display_name,
+                    avatar_media_id=avatar_id,
+                    active=True,
+                    first_seen_at=now,
+                    last_seen_at=now,
+                )
+                db.add(member)
+                db.flush()
+            else:
+                member.display_name = item.display_name or member.display_name
+                member.avatar_media_id = avatar_id or member.avatar_media_id
+                member.last_seen_at = now
+            observed = db.scalar(
+                select(RelationshipScanMember).where(
+                    RelationshipScanMember.scan_id == scan.id,
+                    RelationshipScanMember.member_id == member.id,
+                )
+            )
+            if not observed:
+                db.add(RelationshipScanMember(scan_id=scan.id, member_id=member.id))
+                saved += 1
+
+        db.flush()
+        scan.cursor = batch.cursor
+        scan.collected_count = int(
+            db.scalar(
+                select(func.count(RelationshipScanMember.id)).where(
+                    RelationshipScanMember.scan_id == scan.id
+                )
+            )
+            or 0
+        )
+        if batch.complete:
+            self._complete_relationship_scan(db, account, scan)
+        return saved
+
+    @staticmethod
+    def _complete_relationship_scan(
+        db: Session, account: Account, scan: RelationshipScan
+    ) -> None:
+        now = now_utc()
+        previous = db.scalar(
+            select(RelationshipScan)
+            .where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == scan.relationship_type,
+                RelationshipScan.status == "complete",
+                RelationshipScan.id != scan.id,
+            )
+            .order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc())
+            .limit(1)
+        )
+        current_ids = set(
+            db.scalars(
+                select(RelationshipScanMember.member_id).where(
+                    RelationshipScanMember.scan_id == scan.id
+                )
+            ).all()
+        )
+        previous_ids: set[int] = set()
+        if previous:
+            previous_ids = set(
+                db.scalars(
+                    select(RelationshipScanMember.member_id).where(
+                        RelationshipScanMember.scan_id == previous.id
+                    )
+                ).all()
+            )
+            for member_id in current_ids - previous_ids:
+                db.add(
+                    RelationshipChange(
+                        account_id=account.id,
+                        scan_id=scan.id,
+                        member_id=member_id,
+                        relationship_type=scan.relationship_type,
+                        change_type="added",
+                        observed_date=scan.scan_date,
+                    )
+                )
+            for member_id in previous_ids - current_ids:
+                db.add(
+                    RelationshipChange(
+                        account_id=account.id,
+                        scan_id=scan.id,
+                        member_id=member_id,
+                        relationship_type=scan.relationship_type,
+                        change_type="removed",
+                        observed_date=scan.scan_date,
+                    )
+                )
+
+        members = db.scalars(
+            select(RelationshipMember).where(
+                RelationshipMember.account_id == account.id,
+                RelationshipMember.relationship_type == scan.relationship_type,
+            )
+        ).all()
+        for member in members:
+            member.active = member.id in current_ids
+            if member.active:
+                member.last_seen_at = now
+                member.removed_at = None
+            elif previous and member.id in previous_ids:
+                member.removed_at = now
+        scan.status = "complete"
+        scan.completed_at = now
 
     def _schedule_stream(self, db: Session, account: Account) -> None:
         db.flush()
@@ -316,6 +524,22 @@ class JobProcessor:
         if not account:
             return
         account.last_attempt_at = now
+        if job.kind == "relationship":
+            scan = db.scalar(
+                select(RelationshipScan)
+                .where(
+                    RelationshipScan.account_id == account.id,
+                    RelationshipScan.relationship_type == job.content_type,
+                    RelationshipScan.status == "running",
+                )
+                .order_by(RelationshipScan.id)
+                .limit(1)
+            )
+            if scan:
+                scan.status = "failed"
+                scan.completed_at = now
+            if not login_required:
+                return
         account.status_message = message
         if login_required:
             account.status = "login_required"

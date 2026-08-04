@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{% block title %}Threads Public Monitor{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/relationships.css') }}">
   <script defer src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
   <script defer src="{{ url_for('static', path='/app.js') }}"></script>
@@ -20,4 +21,3 @@
   <main class="page-shell">{% block content %}{% endblock %}</main>
 </body>
 </html>
-

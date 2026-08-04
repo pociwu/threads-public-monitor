@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -50,6 +51,97 @@ class Account(Base):
     streams: Mapped[list[CollectionStream]] = relationship(
         back_populates="account", cascade="all, delete-orphan"
     )
+
+
+class RelationshipMember(Base):
+    __tablename__ = "relationship_members"
+    __table_args__ = (
+        UniqueConstraint("account_id", "relationship_type", "username"),
+        Index(
+            "ix_relationship_members_account_type_active",
+            "account_id",
+            "relationship_type",
+            "active",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    relationship_type: Mapped[str] = mapped_column(String(16))
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    display_name: Mapped[str | None] = mapped_column(String(255))
+    avatar_media_id: Mapped[int | None] = mapped_column(ForeignKey("media_assets.id"))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    avatar: Mapped[MediaAsset | None] = relationship(foreign_keys=[avatar_media_id])
+
+
+class RelationshipScan(Base):
+    __tablename__ = "relationship_scans"
+    __table_args__ = (
+        UniqueConstraint("account_id", "relationship_type", "scan_date"),
+        Index(
+            "ix_relationship_scans_account_type_status",
+            "account_id",
+            "relationship_type",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    relationship_type: Mapped[str] = mapped_column(String(16))
+    scan_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    cursor: Mapped[str | None] = mapped_column(String(64))
+    collected_count: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class RelationshipScanMember(Base):
+    __tablename__ = "relationship_scan_members"
+    __table_args__ = (UniqueConstraint("scan_id", "member_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(
+        ForeignKey("relationship_scans.id", ondelete="CASCADE"), index=True
+    )
+    member_id: Mapped[int] = mapped_column(
+        ForeignKey("relationship_members.id", ondelete="CASCADE"), index=True
+    )
+
+
+class RelationshipChange(Base):
+    __tablename__ = "relationship_changes"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "member_id", "change_type"),
+        Index("ix_relationship_changes_account_date", "account_id", "observed_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    scan_id: Mapped[int] = mapped_column(
+        ForeignKey("relationship_scans.id", ondelete="CASCADE"), index=True
+    )
+    member_id: Mapped[int] = mapped_column(
+        ForeignKey("relationship_members.id", ondelete="CASCADE"), index=True
+    )
+    relationship_type: Mapped[str] = mapped_column(String(16))
+    change_type: Mapped[str] = mapped_column(String(16))
+    observed_date: Mapped[date] = mapped_column(Date, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    member: Mapped[RelationshipMember] = relationship()
 
 
 class CollectionStream(Base):

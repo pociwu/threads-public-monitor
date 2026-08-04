@@ -56,6 +56,20 @@ class ContentData:
     quoted_threads_id: str | None = None
 
 
+@dataclass(slots=True)
+class RelationshipMemberData:
+    username: str
+    display_name: str | None
+    avatar_url: str | None
+
+
+@dataclass(slots=True)
+class RelationshipBatch:
+    members: list[RelationshipMemberData]
+    cursor: str | None
+    complete: bool
+
+
 def parse_count(value: str | None) -> int | None:
     if not value:
         return None
@@ -307,6 +321,153 @@ class ThreadsCollector:
                 if len(items) >= limit:
                     break
             return items
+        finally:
+            page.close()
+
+    def collect_relationships(
+        self,
+        username: str,
+        relationship_type: str,
+        limit: int = 5,
+        cursor: str | None = None,
+    ) -> RelationshipBatch:
+        if relationship_type not in {"followers", "following"}:
+            raise CollectionError(f"未知關係類型：{relationship_type}")
+        page = self._page(f"https://www.threads.com/@{username}")
+        try:
+            opened = page.evaluate(
+                r"""() => {
+                  const controls = [...document.querySelectorAll('a,button,[role="button"]')];
+                  const target = controls.find(el => {
+                    const text = [el.getAttribute('aria-label') || '', el.textContent || '']
+                      .join(' ').replace(/\s+/g, ' ').trim();
+                    return text.length < 240 && /粉絲|followers?/i.test(text);
+                  });
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }"""
+            )
+            if opened and relationship_type == "following":
+                page.wait_for_timeout(800)
+                opened = page.evaluate(
+                    r"""() => {
+                      const dialog = document.querySelector(
+                        '[role="dialog"],[aria-modal="true"]'
+                      );
+                      if (!dialog) return false;
+                      const controls = [...dialog.querySelectorAll('a,button,[role="button"]')];
+                      const target = controls.find(el => /追蹤中|following/i.test(
+                        [el.getAttribute('aria-label') || '', el.textContent || ''].join(' ')
+                      ));
+                      if (!target) return false;
+                      target.click();
+                      return true;
+                    }"""
+                )
+            if not opened:
+                raise CollectionError(
+                    "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
+                )
+            page.wait_for_timeout(1000)
+            raw: dict[str, Any] = page.evaluate(
+                r"""async ({owner, limit, cursor}) => {
+                  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+                  const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
+                  if (!dialog) {
+                    return {members: [], complete: false, cursorFound: !cursor, available: false};
+                  }
+                  const candidates = [dialog, ...dialog.querySelectorAll('*')]
+                    .filter(el => el.scrollHeight > el.clientHeight + 40);
+                  const scroller = candidates.sort(
+                    (a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
+                  )[0] || dialog;
+                  const ordered = [];
+                  const seen = new Set();
+                  let cursorFound = !cursor;
+                  let stagnant = 0;
+                  let previousSize = 0;
+                  let complete = false;
+
+                  for (let turn = 0; turn < 80; turn++) {
+                    for (const anchor of dialog.querySelectorAll('a[href^="/@"]')) {
+                      const match = (anchor.getAttribute('href') || '').match(/^\/@([^/?#]+)/);
+                      if (!match) continue;
+                      const memberUsername = decodeURIComponent(match[1]).toLowerCase();
+                      if (memberUsername === owner.toLowerCase() || seen.has(memberUsername)) continue;
+                      let item = anchor;
+                      for (let level = 0; level < 5 && item.parentElement; level++) {
+                        item = item.parentElement;
+                        if (item.querySelector('img') && item.innerText.trim().length > 0) break;
+                      }
+                      const image = item.querySelector('img');
+                      const lines = (item.innerText || '').split('\n').map(v => v.trim()).filter(Boolean);
+                      const displayName = lines.find(line =>
+                        line.toLowerCase() !== memberUsername &&
+                        line.toLowerCase() !== `@${memberUsername}` &&
+                        !/追蹤|follow/i.test(line)
+                      ) || null;
+                      seen.add(memberUsername);
+                      ordered.push({
+                        username: memberUsername,
+                        displayName,
+                        avatarUrl: image?.currentSrc || image?.src || null
+                      });
+                      if (memberUsername === (cursor || '').toLowerCase()) cursorFound = true;
+                    }
+
+                    const afterCursor = cursorFound
+                      ? ordered.slice(cursor ? ordered.findIndex(m => m.username === cursor.toLowerCase()) + 1 : 0)
+                      : [];
+                    if (afterCursor.length > limit) {
+                      return {
+                        members: afterCursor.slice(0, limit), complete: false,
+                        cursorFound, available: true
+                      };
+                    }
+                    const atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
+                    if (atEnd && ordered.length === previousSize) stagnant += 1;
+                    else stagnant = 0;
+                    if (atEnd && stagnant >= 2) {
+                      complete = true;
+                      return {
+                        members: afterCursor.slice(0, limit), complete,
+                        cursorFound, available: true
+                      };
+                    }
+                    previousSize = ordered.length;
+                    scroller.scrollTop = Math.min(
+                      scroller.scrollTop + Math.max(scroller.clientHeight * 0.8, 320),
+                      scroller.scrollHeight
+                    );
+                    scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
+                    await sleep(450);
+                  }
+                  const start = cursor
+                    ? ordered.findIndex(m => m.username === cursor.toLowerCase()) + 1 : 0;
+                  const members = cursorFound ? ordered.slice(start, start + limit) : [];
+                  return {members, complete: false, cursorFound, available: true};
+                }""",
+                {"owner": username, "limit": limit, "cursor": cursor},
+            )
+            if not raw.get("available", True):
+                raise CollectionError("Threads 名單視窗未成功開啟")
+            if cursor and not raw.get("cursorFound"):
+                raise CollectionError("Threads 關係名單已變動，無法延續本次分批游標")
+            members = [
+                RelationshipMemberData(
+                    username=item["username"],
+                    display_name=item.get("displayName"),
+                    avatar_url=item.get("avatarUrl"),
+                )
+                for item in raw.get("members", [])
+                if item.get("username")
+            ]
+            return RelationshipBatch(
+                members=members,
+                cursor=members[-1].username if members else cursor,
+                complete=bool(raw.get("complete")),
+            )
         finally:
             page.close()
 

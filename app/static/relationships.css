@@ -1,0 +1,17 @@
+.profile-stats a:hover strong { color: #c4b5fd; }
+.relationship-panel { background: linear-gradient(145deg,#191621,#111016); border: 1px solid var(--line); border-radius: 18px; padding: 20px; }
+.scan-summary { color: var(--muted); font-size: 13px; }
+.member-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap: 10px; }
+.member-card { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px; }
+.member-card:hover,.change-row:hover { border-color: #4b4559; }
+.member-card strong,.member-card small { display: block; }
+.member-card small,.member-card time,.change-row small { color: var(--muted); font-size: 11px; }
+.change-list { display: grid; gap: 8px; }
+.change-row { display: grid; grid-template-columns: 90px auto 70px auto 1fr auto; align-items: center; gap: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.change-row .avatar { width: 36px; height: 36px; }
+.change-row small { justify-self: end; }
+@media(max-width:760px) {
+  .change-row { grid-template-columns: auto auto 1fr; }
+  .change-row .avatar { grid-column: 1; }
+  .change-row small { justify-self: start; }
+}

@@ -11,7 +11,7 @@
   </div>
   {% if account.bio %}<p class="bio">{{ account.bio }}</p>{% endif %}
   {% if account.external_url %}<a class="profile-link" href="{{ account.external_url }}" target="_blank" rel="noreferrer">{{ account.external_url }}</a>{% endif %}
-  <div class="profile-stats"><div><strong>{{ account.follower_count|number }}</strong><span>粉絲</span></div><div><strong>{{ account.following_count|number }}</strong><span>追蹤中</span></div><div><strong>{{ account.last_success_at|localtime }}</strong><span>最後成功</span></div></div>
+  <div class="profile-stats"><a href="/accounts/{{ account.id }}?tab=followers"><strong>{{ account.follower_count|number }}</strong><span>粉絲 · 查看名單</span></a><a href="/accounts/{{ account.id }}?tab=following"><strong>{{ account.following_count|number }}</strong><span>追蹤中 · 查看名單</span></a><div><strong>{{ account.last_success_at|localtime }}</strong><span>最後成功</span></div></div>
   <form class="interval-form" method="post" action="/accounts/{{ account.id }}/interval"><label>拜訪週期<select name="interval_hours" onchange="this.form.submit()">{% for h in [6,12,24] %}<option value="{{ h }}" {{ 'selected' if account.interval_hours == h else '' }}>{{ h }} 小時</option>{% endfor %}</select></label></form>
 </section>
 
@@ -44,12 +44,40 @@
 </details>
 
 <nav class="tabs">
-  {% for key,label in [('all','全部'),('post','串文'),('reply','回覆'),('repost','轉發'),('quote','引用轉發'),('media','影音'),('runs','擷取紀錄')] %}
+  {% for key,label in [('all','全部'),('post','串文'),('reply','回覆'),('repost','轉發'),('quote','引用轉發'),('media','影音'),('followers','粉絲名單'),('following','追蹤中'),('changes','每日差異'),('runs','擷取紀錄')] %}
   <a class="{{ 'active' if tab == key else '' }}" href="/accounts/{{ account.id }}?tab={{ key }}">{{ label }}</a>
   {% endfor %}
 </nav>
 
-{% if tab == 'runs' %}
+{% if tab in ['followers', 'following'] %}
+<section class="relationship-panel">
+  <div class="section-heading"><h2>{{ '粉絲名單' if tab == 'followers' else '追蹤中名單' }}</h2><span class="muted">每批 {{ relationship_batch_size }} 人</span></div>
+  {% if relationship_scan %}
+  <p class="scan-summary"><span class="status status-{{ 'succeeded' if relationship_scan.status == 'complete' else ('queued' if relationship_scan.status == 'running' else 'failed') }}">{{ {'complete':'本輪完成','running':'分批擷取中','failed':'本輪失敗'}.get(relationship_scan.status, relationship_scan.status) }}</span> 已擷取 {{ relationship_scan.collected_count }} 人 · 掃描日期 {{ relationship_scan.scan_date }}{% if relationship_scan.status != 'complete' %} · 未完成前不計算退出名單{% endif %}</p>
+  {% else %}<p class="muted">尚未開始擷取；下次帳號拜訪後會建立第一輪名單。</p>{% endif %}
+  <div class="member-grid">
+    {% for member in relationship_members %}
+    <a class="member-card" href="https://www.threads.com/@{{ member.username }}" target="_blank" rel="noreferrer">
+      {% if member.avatar and member.avatar.local_path %}<img class="avatar" loading="lazy" src="/media/{{ member.avatar.local_path }}" alt="{{ member.username }} 頭像">{% else %}<span class="avatar placeholder">@</span>{% endif %}
+      <span><strong>{{ member.display_name or member.username }}</strong><small>@{{ member.username }}</small></span><time>{{ member.last_seen_at|localtime }}</time>
+    </a>
+    {% else %}<div class="empty-state small">尚未保存任何可見名單</div>{% endfor %}
+  </div>
+</section>
+{% elif tab == 'changes' %}
+<section class="relationship-panel">
+  <div class="section-heading"><h2>每日差異名單</h2><span class="muted">完整掃描後才產生差異</span></div>
+  <div class="change-list">
+    {% for change in relationship_changes %}
+    <a class="change-row" href="https://www.threads.com/@{{ change.member.username }}" target="_blank" rel="noreferrer">
+      <time>{{ change.observed_date }}</time><span class="status status-{{ 'succeeded' if change.change_type == 'added' else 'failed' }}">{{ '新增' if change.change_type == 'added' else '退出' }}</span><span>{{ '粉絲' if change.relationship_type == 'followers' else '追蹤中' }}</span>
+      {% if change.member.avatar and change.member.avatar.local_path %}<img class="avatar" loading="lazy" src="/media/{{ change.member.avatar.local_path }}" alt="{{ change.member.username }} 頭像">{% else %}<span class="avatar placeholder">@</span>{% endif %}
+      <strong>{{ change.member.display_name or change.member.username }}</strong><small>@{{ change.member.username }}</small>
+    </a>
+    {% else %}<div class="empty-state small">首次完整掃描只建立基準；從下一次完整掃描開始顯示新增與退出。</div>{% endfor %}
+  </div>
+</section>
+{% elif tab == 'runs' %}
 <section class="run-list">
   {% for run in runs %}<article class="run-row"><span class="status status-{{ run.status }}">{{ run.status }}</span><strong>{{ run.job_kind }}{% if run.content_type %} · {{ run.content_type }}{% endif %}</strong><span>{{ run.item_count }} 筆</span><time>{{ run.started_at|localtime }}</time>{% if run.message %}<p>{{ run.message }}</p>{% endif %}</article>{% else %}<div class="empty-state small">尚無擷取紀錄</div>{% endfor %}
 </section>

@@ -1,3 +1,5 @@
+from datetime import date
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -5,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account, CollectionStream, Job
+from app.models import Account, CollectionStream, Job, RelationshipMember, RelationshipScan
 
 
 def make_client() -> tuple[TestClient, Session]:
@@ -137,6 +139,44 @@ def test_retry_moves_login_required_account_back_to_pending() -> None:
         assert job is not None
         assert job.kind == "verify"
         assert job.status == "queued"
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_account_detail_shows_relationship_tabs_members_and_scan_status() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        db.add(
+            RelationshipMember(
+                account_id=account.id,
+                relationship_type="followers",
+                username="alice",
+                display_name="Alice",
+                active=True,
+            )
+        )
+        db.add(
+            RelationshipScan(
+                account_id=account.id,
+                relationship_type="followers",
+                scan_date=date(2026, 8, 4),
+                status="running",
+                collected_count=5,
+            )
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}?tab=followers")
+
+        assert response.status_code == 200
+        assert "粉絲名單" in response.text
+        assert "每日差異" in response.text
+        assert "已擷取 5 人" in response.text
+        assert "@alice" in response.text
     finally:
         app.dependency_overrides.clear()
         db.close()

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     schedule_jitter_minutes: int = 30
     batch_size: int = 10
     backfill_limit: int = 100
+    relationship_batch_size: int = 5
     log_level: str = "INFO"
 
     chromium_executable: str = Field(default="/usr/bin/chromium")

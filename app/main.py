@@ -24,6 +24,9 @@ from app.models import (
     Job,
     MediaAsset,
     ProfileVersion,
+    RelationshipChange,
+    RelationshipMember,
+    RelationshipScan,
     StatSnapshot,
 )
 from app.services.media import media_usage_bytes, media_usage_percent
@@ -282,29 +285,32 @@ def account_detail(
     if not account:
         raise HTTPException(404)
     page_size = 20
-    content_query = (
-        select(Content)
-        .where(Content.account_id == account.id)
-        .options(
-            selectinload(Content.versions),
-            selectinload(Content.media_links).selectinload(ContentMedia.media),
+    contents = []
+    has_next = False
+    if tab not in {"runs", "followers", "following", "changes"}:
+        content_query = (
+            select(Content)
+            .where(Content.account_id == account.id)
+            .options(
+                selectinload(Content.versions),
+                selectinload(Content.media_links).selectinload(ContentMedia.media),
+            )
         )
-    )
-    if tab in {"post", "reply", "repost", "quote"}:
-        content_query = content_query.where(Content.content_type == tab)
-    elif tab == "media":
-        content_query = content_query.join(ContentMedia).distinct()
-    contents = (
-        db.scalars(
-            content_query.order_by(Content.published_at.desc().nullslast(), Content.id.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size + 1)
+        if tab in {"post", "reply", "repost", "quote"}:
+            content_query = content_query.where(Content.content_type == tab)
+        elif tab == "media":
+            content_query = content_query.join(ContentMedia).distinct()
+        contents = (
+            db.scalars(
+                content_query.order_by(Content.published_at.desc().nullslast(), Content.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size + 1)
+            )
+            .unique()
+            .all()
         )
-        .unique()
-        .all()
-    )
-    has_next = len(contents) > page_size
-    contents = contents[:page_size]
+        has_next = len(contents) > page_size
+        contents = contents[:page_size]
     content_views = []
     for content in contents:
         metrics = db.scalar(
@@ -337,6 +343,46 @@ def account_detail(
             .order_by(CollectionRun.started_at.desc())
             .limit(100)
         ).all()
+    relationship_members = []
+    relationship_scan = None
+    if tab in {"followers", "following"}:
+        relationship_members = db.scalars(
+            select(RelationshipMember)
+            .where(
+                RelationshipMember.account_id == account.id,
+                RelationshipMember.relationship_type == tab,
+                RelationshipMember.active.is_(True),
+            )
+            .options(selectinload(RelationshipMember.avatar))
+            .order_by(RelationshipMember.display_name, RelationshipMember.username)
+            .offset((page - 1) * 50)
+            .limit(51)
+        ).all()
+        has_next = len(relationship_members) > 50
+        relationship_members = relationship_members[:50]
+        relationship_scan = db.scalar(
+            select(RelationshipScan)
+            .where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == tab,
+            )
+            .order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc())
+            .limit(1)
+        )
+    relationship_changes = []
+    if tab == "changes":
+        relationship_changes = db.scalars(
+            select(RelationshipChange)
+            .where(RelationshipChange.account_id == account.id)
+            .options(selectinload(RelationshipChange.member).selectinload(RelationshipMember.avatar))
+            .order_by(
+                RelationshipChange.observed_date.desc(), RelationshipChange.id.desc()
+            )
+            .offset((page - 1) * 100)
+            .limit(101)
+        ).all()
+        has_next = len(relationship_changes) > 100
+        relationship_changes = relationship_changes[:100]
     return templates.TemplateResponse(
         request,
         "account.html",
@@ -347,6 +393,10 @@ def account_detail(
             "has_next": has_next,
             "content_views": content_views,
             "runs": runs,
+            "relationship_members": relationship_members,
+            "relationship_scan": relationship_scan,
+            "relationship_changes": relationship_changes,
+            "relationship_batch_size": settings.relationship_batch_size,
             "chart_data": chart_data,
             "stream_views": _stream_views(account),
             "backfill_limit": settings.backfill_limit,
@@ -376,6 +426,11 @@ def delete_account(account_id: int, confirmation: str = Form(...), db: Session =
             ),
             ~MediaAsset.id.in_(
                 select(Account.avatar_media_id).where(Account.avatar_media_id.is_not(None))
+            ),
+            ~MediaAsset.id.in_(
+                select(RelationshipMember.avatar_media_id).where(
+                    RelationshipMember.avatar_media_id.is_not(None)
+                )
             ),
         )
     ).all()

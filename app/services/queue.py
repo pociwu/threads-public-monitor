@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.models import Account, Job, RuntimeState
 
+GLOBAL_NEXT_BATCH_KEY = "global-next-batch-at"
+
 
 def now_utc() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -90,9 +92,34 @@ def increment_daily_batch_count(db: Session, settings: Settings) -> int:
     return value
 
 
+def global_next_batch_at(db: Session) -> datetime | None:
+    state = db.get(RuntimeState, GLOBAL_NEXT_BATCH_KEY)
+    if not state:
+        return None
+    try:
+        return datetime.fromisoformat(state.value)
+    except ValueError:
+        return None
+
+
+def defer_global_next_batch(db: Session, settings: Settings, now: datetime) -> datetime:
+    next_at = now + timedelta(
+        seconds=random.randint(settings.batch_min_delay_seconds, settings.batch_max_delay_seconds)
+    )
+    state = db.get(RuntimeState, GLOBAL_NEXT_BATCH_KEY)
+    if state is None:
+        db.add(RuntimeState(key=GLOBAL_NEXT_BATCH_KEY, value=next_at.isoformat()))
+    else:
+        state.value = next_at.isoformat()
+    return next_at
+
+
 def claim_next_job(db: Session, settings: Settings) -> Job | None:
     now = now_utc()
     if get_daily_batch_count(db, settings) >= settings.daily_batch_limit:
+        return None
+    global_not_before = global_next_batch_at(db)
+    if global_not_before and global_not_before > now:
         return None
     job = db.scalar(
         select(Job)
@@ -106,6 +133,7 @@ def claim_next_job(db: Session, settings: Settings) -> Job | None:
     job.started_at = now
     job.attempts += 1
     increment_daily_batch_count(db, settings)
+    defer_global_next_batch(db, settings, now)
     db.flush()
     return job
 
