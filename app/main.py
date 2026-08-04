@@ -196,8 +196,8 @@ def retry_account(account_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404)
     account.cooldown_until = None
     account.next_due_at = now_utc()
-    if account.status != "login_required":
-        account.status = "pending" if not account.last_success_at else "queued"
+    account.status = "pending" if not account.last_success_at else "queued"
+    account.status_message = None
     enqueue_unique(
         db,
         kind="verify" if not account.last_success_at else "profile",

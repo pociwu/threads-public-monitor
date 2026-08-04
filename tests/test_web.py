@@ -5,7 +5,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account
+from app.models import Account, Job
 
 
 def make_client() -> tuple[TestClient, Session]:
@@ -56,6 +56,32 @@ def test_reorder_accounts_persists_order() -> None:
         db.refresh(second)
         assert second.sort_order == 0
         assert first.sort_order == 1
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_retry_moves_login_required_account_back_to_pending() -> None:
+    client, db = make_client()
+    try:
+        account = Account(
+            username="example",
+            status="login_required",
+            status_message="Threads 登入工作階段已失效",
+        )
+        db.add(account)
+        db.commit()
+
+        response = client.post(f"/accounts/{account.id}/retry", follow_redirects=False)
+
+        assert response.status_code == 303
+        db.refresh(account)
+        assert account.status == "pending"
+        assert account.status_message is None
+        job = db.scalar(select(Job).where(Job.account_id == account.id))
+        assert job is not None
+        assert job.kind == "verify"
+        assert job.status == "queued"
     finally:
         app.dependency_overrides.clear()
         db.close()

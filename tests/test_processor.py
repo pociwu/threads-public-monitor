@@ -95,6 +95,34 @@ def test_profile_job_versions_profile_and_schedules_stream(tmp_path) -> None:
         assert db.scalar(select(func.count(Job.id)).where(Job.kind == "content")) == 1
 
 
+def test_successful_retry_clears_login_required_status(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    with make_session() as db:
+        account = Account(
+            username="example",
+            status="login_required",
+            status_message="Threads 登入工作階段已失效",
+        )
+        db.add(account)
+        db.flush()
+        job = Job(account_id=account.id, kind="verify", status="running")
+        db.add(job)
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", FakeCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert account.status == "active"
+        assert account.status_message is None
+
+
 def test_content_job_saves_version_and_changed_metrics(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
