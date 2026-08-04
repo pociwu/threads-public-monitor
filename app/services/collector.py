@@ -88,15 +88,20 @@ class ThreadsCollector:
     def __enter__(self) -> ThreadsCollector:
         self._playwright = sync_playwright().start()
         executable = Path(self.settings.chromium_executable)
-        self._context = self._playwright.chromium.launch_persistent_context(
-            str(self.settings.browser_profile_dir),
-            executable_path=str(executable) if executable.exists() else None,
-            headless=True,
-            locale="zh-TW",
-            timezone_id=self.settings.timezone,
-            viewport={"width": 1280, "height": 1200},
-            args=["--disable-dev-shm-usage", "--no-sandbox"],
-        )
+        try:
+            self._context = self._playwright.chromium.launch_persistent_context(
+                str(self.settings.browser_profile_dir),
+                executable_path=str(executable) if executable.exists() else None,
+                headless=True,
+                locale="zh-TW",
+                timezone_id=self.settings.timezone,
+                viewport={"width": 1280, "height": 1200},
+                args=["--disable-dev-shm-usage", "--no-sandbox"],
+            )
+        except BaseException:
+            self._playwright.stop()
+            self._playwright = None
+            raise
         return self
 
     def __exit__(self, *_args: object) -> None:

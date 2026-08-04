@@ -26,9 +26,14 @@ def test_login_script_removes_stale_chromium_profile_locks_after_worker_stops() 
     script = (ROOT / "scripts/login.sh").read_text(encoding="utf-8")
 
     worker_stop = script.index("docker compose stop worker")
-    lock_cleanup = script.index("browser-profile/SingletonLock")
+    first_lock_cleanup = script.index("\ncleanup_profile_locks\n", worker_stop)
     browser_start = script.index("docker compose --profile login up -d browser-login")
+    browser_stop = script.index("docker compose --profile login stop browser-login")
+    second_lock_cleanup = script.index("\ncleanup_profile_locks\n", browser_stop)
+    worker_start = script.index("docker compose start worker")
 
-    assert worker_stop < lock_cleanup < browser_start
+    assert worker_stop < first_lock_cleanup < browser_start
+    assert browser_stop < second_lock_cleanup < worker_start
+    assert script.count("cleanup_profile_locks") == 3
     assert "browser-profile/SingletonCookie" in script
     assert "browser-profile/SingletonSocket" in script

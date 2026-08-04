@@ -4,15 +4,20 @@ set -Eeuo pipefail
 source scripts/env.sh
 TAILSCALE_IP="$(read_env_value .env TAILSCALE_IP 100.120.200.116)"
 LOGIN_PORT="$(read_env_value .env LOGIN_PORT 6080)"
+
+cleanup_profile_locks() {
+  rm -f -- \
+    browser-profile/SingletonLock \
+    browser-profile/SingletonCookie \
+    browser-profile/SingletonSocket
+}
+
 docker compose stop worker
 
 # Chromium leaves these process-singleton symlinks behind when its container is
 # interrupted.  The worker is stopped above, so no Chromium process belonging
 # to this project can still be using the shared profile at this point.
-rm -f -- \
-  browser-profile/SingletonLock \
-  browser-profile/SingletonCookie \
-  browser-profile/SingletonSocket
+cleanup_profile_locks
 
 docker compose --profile login up -d browser-login
 
@@ -21,5 +26,6 @@ echo "完成 Threads 登入後，按 Enter 關閉登入瀏覽器並恢復 Worker
 read -r
 
 docker compose --profile login stop browser-login
+cleanup_profile_locks
 docker compose start worker
 echo "登入工作階段已保存，背景擷取已恢復。"

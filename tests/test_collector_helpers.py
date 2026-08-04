@@ -1,6 +1,7 @@
 import pytest
 
-from app.services.collector import content_fingerprint, parse_count
+from app.config import Settings
+from app.services.collector import ThreadsCollector, content_fingerprint, parse_count
 
 
 @pytest.mark.parametrize(
@@ -23,3 +24,35 @@ def test_content_fingerprint_is_order_independent_for_media() -> None:
     second = content_fingerprint("hello", ["a", "b"])
     assert first == second
     assert first != content_fingerprint("changed", ["a", "b"])
+
+
+def test_collector_stops_playwright_when_browser_launch_fails(monkeypatch, tmp_path) -> None:
+    class FailingChromium:
+        def launch_persistent_context(self, *_args, **_kwargs):
+            raise RuntimeError("browser launch failed")
+
+    class FakePlaywright:
+        chromium = FailingChromium()
+
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    runtime = FakePlaywright()
+
+    class FakeManager:
+        def start(self):
+            return runtime
+
+    monkeypatch.setattr("app.services.collector.sync_playwright", FakeManager)
+    collector = ThreadsCollector(
+        Settings(browser_profile_dir=tmp_path / "profile", chromium_executable="missing")
+    )
+
+    with pytest.raises(RuntimeError, match="browser launch failed"):
+        collector.__enter__()
+
+    assert runtime.stopped is True
+    assert collector._playwright is None
