@@ -1,3 +1,3 @@
 """Threads Public Monitor."""
 
-__version__ = "0.1.10"
+__version__ = "0.1.11"

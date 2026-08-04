@@ -32,7 +32,7 @@ services:
 
   worker:
     <<: *app
-    command: ["python", "-m", "app.worker"]
+    command: ["/app/scripts/worker-entrypoint.sh"]
     depends_on:
       web:
         condition: service_healthy

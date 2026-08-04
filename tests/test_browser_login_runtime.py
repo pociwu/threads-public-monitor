@@ -37,3 +37,22 @@ def test_login_script_removes_stale_chromium_profile_locks_after_worker_stops() 
     assert script.count("cleanup_profile_locks") == 3
     assert "browser-profile/SingletonCookie" in script
     assert "browser-profile/SingletonSocket" in script
+
+
+def test_worker_entrypoint_removes_only_stale_chromium_profile_locks_before_start() -> None:
+    entrypoint = (ROOT / "scripts/worker-entrypoint.sh").read_text(encoding="utf-8")
+
+    lock_cleanup = entrypoint.index("rm -f --")
+    worker_start = entrypoint.index("exec python -m app.worker")
+
+    assert lock_cleanup < worker_start
+    assert "/browser-profile/SingletonLock" in entrypoint
+    assert "/browser-profile/SingletonCookie" in entrypoint
+    assert "/browser-profile/SingletonSocket" in entrypoint
+    assert "Singleton*" not in entrypoint
+
+
+def test_compose_starts_worker_through_lock_cleanup_entrypoint() -> None:
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+
+    assert 'command: ["/app/scripts/worker-entrypoint.sh"]' in compose
