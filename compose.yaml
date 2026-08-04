@@ -1,0 +1,47 @@
+name: threads-public-monitor
+
+x-app: &app
+  build:
+    context: .
+  image: threads-public-monitor:local
+  env_file: .env
+  environment:
+    DATABASE_URL: sqlite:////data/threads-monitor.db
+    MEDIA_ROOT: /data/media
+    BROWSER_PROFILE_DIR: /browser-profile
+    CHROMIUM_EXECUTABLE: /usr/bin/chromium
+  volumes:
+    - ./data:/data
+    - ./backups:/backups
+    - ./browser-profile:/browser-profile
+  restart: unless-stopped
+  init: true
+
+services:
+  web:
+    <<: *app
+    command: ["/app/scripts/web-entrypoint.sh"]
+    ports:
+      - "${TAILSCALE_IP:-100.120.200.116}:${WEB_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      web:
+        condition: service_healthy
+
+  browser-login:
+    <<: *app
+    profiles: ["login"]
+    command: ["/app/scripts/browser-login-entrypoint.sh"]
+    ports:
+      - "${TAILSCALE_IP:-100.120.200.116}:${LOGIN_PORT:-6080}:6080"
+    restart: "no"
+    shm_size: 1gb

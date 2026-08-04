@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}@{{ account.username }} · Threads Public Monitor{% endblock %}
+{% block content %}
+<a class="back-link" href="/">← 返回監看首頁</a>
+<section class="profile-panel">
+  <div class="profile-heading">
+    {% if avatar_url %}<img class="avatar large" src="{{ avatar_url }}" alt="{{ account.username }} 頭像">
+    {% else %}<div class="avatar large placeholder">@</div>{% endif %}
+    <div><p class="eyebrow">{{ account.status }}</p><h1>{{ account.display_name or account.username }}</h1><p class="muted">@{{ account.username }}</p></div>
+    <a class="button ghost external" href="https://www.threads.com/@{{ account.username }}" target="_blank" rel="noreferrer">開啟 Threads ↗</a>
+  </div>
+  {% if account.bio %}<p class="bio">{{ account.bio }}</p>{% endif %}
+  {% if account.external_url %}<a class="profile-link" href="{{ account.external_url }}" target="_blank" rel="noreferrer">{{ account.external_url }}</a>{% endif %}
+  <div class="profile-stats"><div><strong>{{ account.follower_count|number }}</strong><span>粉絲</span></div><div><strong>{{ account.following_count|number }}</strong><span>追蹤中</span></div><div><strong>{{ account.last_success_at|localtime }}</strong><span>最後成功</span></div></div>
+  <form class="interval-form" method="post" action="/accounts/{{ account.id }}/interval"><label>拜訪週期<select name="interval_hours" onchange="this.form.submit()">{% for h in [6,12,24] %}<option value="{{ h }}" {{ 'selected' if account.interval_hours == h else '' }}>{{ h }} 小時</option>{% endfor %}</select></label></form>
+</section>
+
+<section class="chart-panel"><div class="section-heading"><h2>帳號趨勢</h2><span class="muted">未知值不以 0 呈現</span></div><canvas id="stats-chart" data-chart='{{ chart_data|safe }}' height="90"></canvas></section>
+
+<nav class="tabs">
+  {% for key,label in [('all','全部'),('post','串文'),('reply','回覆'),('repost','轉發'),('quote','引用轉發'),('media','影音'),('runs','擷取紀錄')] %}
+  <a class="{{ 'active' if tab == key else '' }}" href="/accounts/{{ account.id }}?tab={{ key }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+
+{% if tab == 'runs' %}
+<section class="run-list">
+  {% for run in runs %}<article class="run-row"><span class="status status-{{ run.status }}">{{ run.status }}</span><strong>{{ run.job_kind }}{% if run.content_type %} · {{ run.content_type }}{% endif %}</strong><span>{{ run.item_count }} 筆</span><time>{{ run.started_at|localtime }}</time>{% if run.message %}<p>{{ run.message }}</p>{% endif %}</article>{% else %}<div class="empty-state small">尚無擷取紀錄</div>{% endfor %}
+</section>
+{% else %}
+<section class="feed">
+  {% for item in content_views %}{% set content = item.content %}{% set version = content.versions[-1] if content.versions else none %}
+  <article class="content-card">
+    <header><span class="content-type">{{ {'post':'串文','reply':'回覆','repost':'轉發','quote':'引用轉發'}.get(content.content_type, content.content_type) }}</span><a href="{{ content.source_url }}" target="_blank" rel="noreferrer">@{{ content.author_username }}</a><time>{{ content.published_at|localtime }}</time>{% if content.suspected_removed %}<span class="status status-error">疑似已移除</span>{% endif %}</header>
+    {% if version and version.text %}<p class="content-text">{{ version.text }}</p>{% endif %}
+    {% if content.media_links %}<div class="media-grid">{% for link in content.media_links|sort(attribute='position') %}{% if link.media.local_path %}{% if link.media.media_type == 'video' %}<video controls preload="metadata" src="/media/{{ link.media.local_path }}"></video>{% else %}<img loading="lazy" src="/media/{{ link.media.local_path }}" alt="串文媒體">{% endif %}{% else %}<div class="media-missing">{{ link.media.failure_reason or '媒體尚未保存' }}</div>{% endif %}{% endfor %}</div>{% endif %}
+    {% if item.metrics %}<footer class="engagement"><span>♡ {{ item.metrics.like_count|number }}</span><span>回覆 {{ item.metrics.reply_count|number }}</span><span>轉發 {{ item.metrics.repost_count|number }}</span><span>分享 {{ item.metrics.share_count|number }}</span></footer>{% endif %}
+  </article>
+  {% else %}<div class="empty-state small">此分類尚無內容</div>{% endfor %}
+</section>
+<div class="pagination">{% if page > 1 %}<a class="button ghost" href="?tab={{ tab }}&page={{ page-1 }}">上一頁</a>{% endif %}{% if has_next %}<a class="button ghost" href="?tab={{ tab }}&page={{ page+1 }}">下一頁</a>{% endif %}</div>
+{% endif %}
+
+<details class="danger-zone"><summary>危險操作</summary><h2>永久刪除帳號資料</h2><p>輸入 <code>{{ account.username }}</code> 確認。此操作會刪除歷史資料，且清除不再被引用的媒體。</p><form method="post" action="/accounts/{{ account.id }}/delete" data-confirm="永久刪除 @{{ account.username }} 的所有資料？"><input name="confirmation" required autocomplete="off"><button class="button danger" type="submit">永久刪除</button></form></details>
+{% endblock %}
+

@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}監看首頁 · Threads Public Monitor{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">公開帳號監看</p>
+    <h1>追蹤重要帳號的每次變化</h1>
+    <p class="muted">{{ active_count }}/{{ max_accounts }} 個啟用帳號 · 媒體 {{ '%.2f'|format(usage_gb) }} GB / 100 GB</p>
+  </div>
+  <form class="add-form" method="post" action="/accounts">
+    <label for="username">新增 Threads 帳號</label>
+    <div class="input-row">
+      <input id="username" name="username" placeholder="網址、@username 或 username" required autocomplete="off">
+      <button class="button primary" type="submit">新增監看</button>
+    </div>
+  </form>
+</section>
+
+{% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+{% if login_required %}
+<div class="alert warning"><strong>需要重新登入 Threads。</strong> 請在主機執行 <code>bash scripts/login.sh</code>，完成後重試。</div>
+{% endif %}
+{% if usage_percent >= 95 %}
+<div class="alert danger">媒體使用量已達 {{ '%.1f'|format(usage_percent) }}%，新媒體下載已停止。</div>
+{% elif usage_percent >= 80 %}
+<div class="alert warning">媒體使用量已達 {{ '%.1f'|format(usage_percent) }}%，請規劃清理或擴充空間。</div>
+{% endif %}
+
+<div class="section-heading">
+  <h2>監看帳號</h2>
+  <span class="muted">拖曳把手可保存排序</span>
+</div>
+
+{% if cards %}
+<section id="account-grid" class="card-grid" data-reorder-url="/accounts/reorder">
+  {% for item in cards %}{% set account = item.account %}
+  <article class="account-card" data-account-id="{{ account.id }}">
+    <button class="drag-handle" type="button" aria-label="拖曳 {{ account.username }}">⋮⋮</button>
+    <a class="card-main" href="/accounts/{{ account.id }}">
+      <div class="identity">
+        {% if item.avatar_url %}<img class="avatar" src="{{ item.avatar_url }}" alt="{{ account.username }} 頭像">
+        {% else %}<div class="avatar placeholder">@</div>{% endif %}
+        <div class="identity-copy">
+          <h3>{{ account.display_name or '等待驗證' }}</h3>
+          <span>@{{ account.username }}</span>
+        </div>
+        <span class="status status-{{ account.status }}">{{ {'pending':'待驗證','active':'正常','queued':'排隊中','error':'錯誤','cooldown':'冷卻中','login_required':'需登入'}.get(account.status, account.status) }}</span>
+      </div>
+      <div class="stats">
+        <div><span>粉絲</span><strong>{{ account.follower_count|number }}</strong>{% if item.follower_delta is not none %}<small class="delta {{ 'up' if item.follower_delta >= 0 else 'down' }}">{{ '%+d'|format(item.follower_delta) }}</small>{% endif %}</div>
+        <div><span>追蹤中</span><strong>{{ account.following_count|number }}</strong>{% if item.following_delta is not none %}<small class="delta {{ 'up' if item.following_delta >= 0 else 'down' }}">{{ '%+d'|format(item.following_delta) }}</small>{% endif %}</div>
+      </div>
+      <div class="progress-copy"><span>初始回補</span><span>{{ item.progress }}%</span></div>
+      <div class="progress"><i style="width: {{ item.progress }}%"></i></div>
+      <dl class="timing">
+        <div><dt>最後成功</dt><dd>{{ account.last_success_at|localtime }}</dd></div>
+        <div><dt>下次拜訪</dt><dd>{{ account.next_due_at|localtime }}</dd></div>
+      </dl>
+      {% if account.status_message %}<p class="status-message">{{ account.status_message }}</p>{% endif %}
+    </a>
+    <div class="card-actions">
+      <form method="post" action="/accounts/{{ account.id }}/retry"><button class="button ghost" type="submit">立即重試</button></form>
+      <form method="post" action="/accounts/{{ account.id }}/stop" data-confirm="停止監看 @{{ account.username }}？歷史資料會保留。"><button class="button ghost" type="submit">停止監看</button></form>
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% else %}
+<section class="empty-state"><div class="empty-icon">＠</div><h2>尚未加入監看帳號</h2><p>在上方輸入公開 Threads 帳號開始建立歷史。</p></section>
+{% endif %}
+<footer class="footer">v{{ version }} · 時區 Asia/Taipei</footer>
+{% endblock %}
