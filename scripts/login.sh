@@ -5,6 +5,15 @@ source scripts/env.sh
 TAILSCALE_IP="$(read_env_value .env TAILSCALE_IP 100.120.200.116)"
 LOGIN_PORT="$(read_env_value .env LOGIN_PORT 6080)"
 docker compose stop worker
+
+# Chromium leaves these process-singleton symlinks behind when its container is
+# interrupted.  The worker is stopped above, so no Chromium process belonging
+# to this project can still be using the shared profile at this point.
+rm -f -- \
+  browser-profile/SingletonLock \
+  browser-profile/SingletonCookie \
+  browser-profile/SingletonSocket
+
 docker compose --profile login up -d browser-login
 
 echo "請從 Tailscale 私網開啟：http://${TAILSCALE_IP}:${LOGIN_PORT}/vnc.html?autoconnect=true"
