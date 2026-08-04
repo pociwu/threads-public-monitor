@@ -17,5 +17,5 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest
+      - run: cp .env.example .env
       - run: docker compose config --quiet
-
