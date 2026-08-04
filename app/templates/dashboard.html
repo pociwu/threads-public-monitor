@@ -31,6 +31,7 @@
   <span class="muted">拖曳把手可保存排序</span>
 </div>
 
+<div id="account-grid-region" data-refresh-interval="5000">
 {% if cards %}
 <section id="account-grid" class="card-grid" data-reorder-url="/accounts/reorder">
   {% for item in cards %}{% set account = item.account %}
@@ -68,5 +69,6 @@
 {% else %}
 <section class="empty-state"><div class="empty-icon">＠</div><h2>尚未加入監看帳號</h2><p>在上方輸入公開 Threads 帳號開始建立歷史。</p></section>
 {% endif %}
+</div>
 <footer class="footer">v{{ version }} · 時區 Asia/Taipei</footer>
 {% endblock %}

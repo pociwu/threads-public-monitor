@@ -28,6 +28,8 @@ def test_dashboard_and_add_account() -> None:
         response = client.get("/")
         assert response.status_code == 200
         assert "新增 Threads 帳號" in response.text
+        assert 'id="account-grid-region"' in response.text
+        assert 'data-refresh-interval="5000"' in response.text
 
         response = client.post(
             "/accounts",
