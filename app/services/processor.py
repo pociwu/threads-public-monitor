@@ -32,7 +32,12 @@ from app.services.collector import (
     ThreadsCollector,
     content_fingerprint,
 )
-from app.services.media import MediaStore, media_equivalent, media_identity
+from app.services.media import (
+    MediaStore,
+    deduplicate_media_candidates,
+    media_equivalent,
+    media_identity,
+)
 from app.services.queue import enqueue_unique, next_account_due, next_batch_time, now_utc
 
 STREAM_TYPES = ("post", "reply", "repost", "quote")
@@ -435,13 +440,18 @@ class JobProcessor:
 
             media_assets = []
             item_media_keys: set[tuple[str, str]] = set()
-            linked_media_assets = db.scalars(
-                    select(MediaAsset)
-                    .join(ContentMedia, ContentMedia.media_id == MediaAsset.id)
-                    .where(ContentMedia.content_id == content.id)
-                ).all()
-            linked_media_keys = {media_identity(asset) for asset in linked_media_assets}
-            for position, (url, media_type) in enumerate(item.media):
+            linked_media_links = db.scalars(
+                select(ContentMedia)
+                .where(ContentMedia.content_id == content.id)
+                .order_by(ContentMedia.position, ContentMedia.id)
+            ).all()
+            linked_media_assets = [
+                asset
+                for link in linked_media_links
+                if (asset := db.get(MediaAsset, link.media_id)) is not None
+            ]
+            media_candidates = deduplicate_media_candidates(item.media)
+            for position, (url, media_type) in enumerate(media_candidates):
                 asset = self.media.register(db, url, media_type)
                 asset = self.media.download(db, asset)
                 key = media_identity(asset)
@@ -452,17 +462,31 @@ class JobProcessor:
                     continue
                 item_media_keys.add(key)
                 media_assets.append(asset)
-                if key not in linked_media_keys:
-                    if any(
-                        media_equivalent(asset, existing, self.settings.media_root)
-                        for existing in linked_media_assets
-                    ):
-                        continue
-                    db.add(
-                        ContentMedia(content_id=content.id, media_id=asset.id, position=position)
-                    )
-                    linked_media_keys.add(key)
-                    linked_media_assets.append(asset)
+                matching_index = next(
+                    (
+                        index
+                        for index, existing in enumerate(linked_media_assets)
+                        if media_identity(existing) == key
+                    ),
+                    None,
+                )
+                if matching_index is not None:
+                    existing = linked_media_assets[matching_index]
+                    if (asset.byte_size or 0) > (existing.byte_size or 0):
+                        linked_media_links[matching_index].media_id = asset.id
+                        linked_media_assets[matching_index] = asset
+                    continue
+                if any(
+                    media_equivalent(asset, existing, self.settings.media_root)
+                    for existing in linked_media_assets
+                ):
+                    continue
+                link = ContentMedia(
+                    content_id=content.id, media_id=asset.id, position=position
+                )
+                db.add(link)
+                linked_media_links.append(link)
+                linked_media_assets.append(asset)
 
             fingerprint = content_fingerprint(
                 item.text, [asset.sha256 or asset.source_key for asset in media_assets]

@@ -270,6 +270,61 @@ def test_content_batch_links_canonical_media_only_once_for_duplicate_bytes(tmp_p
         assert len(links) == 1
 
 
+def test_content_batch_prefers_full_size_instagram_variant(tmp_path) -> None:
+    class RecordingMediaStore:
+        def register(self, db, url, media_type):
+            asset = MediaAsset(
+                source_url=url,
+                source_key=url,
+                media_type=media_type,
+                byte_size=300_000,
+                download_status="downloaded",
+            )
+            db.add(asset)
+            db.flush()
+            return asset
+
+        def download(self, _db, asset):
+            return asset
+
+    thumbnail = (
+        "https://scontent.cdninstagram.com/v/t51/same_n.jpg"
+        "?stp=dst-jpg_p240x240&ig_cache_key=SAME"
+    )
+    full_size = (
+        "https://scontent.cdninstagram.com/v/t51/same_n.jpg"
+        "?stp=dst-jpg&ig_cache_key=SAME"
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        db.add(CollectionStream(account_id=account.id, content_type="post"))
+        processor = JobProcessor(settings)
+        processor.media = RecordingMediaStore()
+        item = ContentData(
+            threads_id="resolution-variant",
+            author_username="example",
+            content_type="post",
+            source_url="https://www.threads.com/@example/post/resolution-variant",
+            text="same image",
+            published_at=datetime(2026, 8, 8),
+            media=[(thumbnail, "image"), (full_size, "image")],
+        )
+
+        processor._save_content_batch(db, account, "post", [item])
+        db.flush()
+
+        content = db.scalar(select(Content).where(Content.threads_id == "resolution-variant"))
+        link = db.scalar(select(ContentMedia).where(ContentMedia.content_id == content.id))
+        assert link.media.source_url == full_size
+
+
 def test_content_success_does_not_replace_last_scheduled_profile_visit(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",

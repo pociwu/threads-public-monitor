@@ -4,7 +4,14 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base
 from app.models import Account, Content, ContentMedia, MediaAsset
-from app.services.media import deduplicate_content_media_links, media_usage_bytes, source_key
+from app.services.media import (
+    canonical_media_key,
+    deduplicate_canonical_content_media_links,
+    deduplicate_content_media_links,
+    deduplicate_media_candidates,
+    media_usage_bytes,
+    source_key,
+)
 
 
 def test_source_key_is_stable() -> None:
@@ -141,3 +148,64 @@ def test_different_resolution_copies_are_visually_deduplicated(tmp_path) -> None
 
         assert deduplicate_content_media_links(db, tmp_path) == 1
         assert len(db.scalars(select(ContentMedia)).all()) == 1
+
+
+def test_instagram_resolution_variants_share_identity_and_prefer_full_size() -> None:
+    thumbnail = (
+        "https://scontent-nrt6-1.cdninstagram.com/v/t51/716702651_123_n.jpg"
+        "?stp=dst-jpg_e35_p240x240_tt6&ig_cache_key=SAME%3D%3D.3-ccb7-5"
+    )
+    full_size = (
+        "https://scontent-nrt6-1.cdninstagram.com/v/t51/716702651_123_n.jpg"
+        "?stp=dst-jpg_e35_tt6&ig_cache_key=SAME%3D%3D.3-ccb7-5"
+    )
+
+    assert canonical_media_key(thumbnail) == canonical_media_key(full_size)
+    assert deduplicate_media_candidates(
+        [(thumbnail, "image"), (full_size, "image")]
+    ) == [(full_size, "image")]
+
+
+def test_canonical_media_dedup_keeps_larger_existing_asset() -> None:
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        account = Account(username="example")
+        db.add(account)
+        db.flush()
+        content = Content(
+            threads_id="post-canonical",
+            account_id=account.id,
+            author_username="example",
+            content_type="post",
+            source_url="https://www.threads.com/@example/post/post-canonical",
+        )
+        low = MediaAsset(
+            source_url="https://scontent.cdninstagram.com/v/t51/same_n.jpg?stp=p240x240&ig_cache_key=SAME",
+            source_key="low",
+            media_type="image",
+            byte_size=32_940,
+            download_status="downloaded",
+        )
+        high = MediaAsset(
+            source_url="https://scontent.cdninstagram.com/v/t51/same_n.jpg?ig_cache_key=SAME",
+            source_key="high",
+            media_type="image",
+            byte_size=303_790,
+            download_status="downloaded",
+        )
+        db.add_all([content, low, high])
+        db.flush()
+        db.add_all(
+            [
+                ContentMedia(content_id=content.id, media_id=low.id, position=3),
+                ContentMedia(content_id=content.id, media_id=high.id, position=3),
+            ]
+        )
+        db.commit()
+
+        assert deduplicate_canonical_content_media_links(db) == 1
+        remaining = db.scalar(select(ContentMedia))
+        assert remaining.media_id == high.id

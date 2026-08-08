@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import re
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from PIL import Image, ImageOps
@@ -16,6 +17,47 @@ from app.models import ContentMedia, MediaAsset
 
 def source_key(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def canonical_media_key(url: str) -> str | None:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if not (hostname.endswith("cdninstagram.com") or hostname.endswith("fbcdn.net")):
+        return None
+    cache_key = parse_qs(parsed.query).get("ig_cache_key", [])
+    if cache_key:
+        return f"instagram:{cache_key[0]}"
+    filename = Path(parsed.path).name
+    return f"meta:{filename}" if filename else None
+
+
+def media_url_quality(url: str) -> int:
+    stp = parse_qs(urlparse(url).query).get("stp", [""])[0]
+    dimensions = re.search(r"(?:^|_)p(\d+)x(\d+)(?:_|$)", stp)
+    if dimensions:
+        return int(dimensions.group(1)) * int(dimensions.group(2))
+    return 2**63 - 1
+
+
+def deduplicate_media_candidates(
+    candidates: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    positions: dict[tuple[str, str], int] = {}
+    for candidate in candidates:
+        url, media_type = candidate
+        canonical = canonical_media_key(url)
+        if canonical is None:
+            result.append(candidate)
+            continue
+        key = (media_type, canonical)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(result)
+            result.append(candidate)
+        elif media_url_quality(url) > media_url_quality(result[position][0]):
+            result[position] = candidate
+    return result
 
 
 def media_usage_bytes(db: Session) -> int:
@@ -37,11 +79,46 @@ def media_usage_percent(db: Session, settings: Settings) -> float:
 
 
 def media_identity(asset: MediaAsset) -> tuple[str, str]:
+    canonical = canonical_media_key(asset.source_url)
+    if canonical:
+        return ("canonical", canonical)
     if asset.sha256:
         return ("sha256", asset.sha256)
     if asset.local_path:
         return ("local_path", asset.local_path)
     return ("source_key", asset.source_key)
+
+
+def deduplicate_canonical_content_media_links(db: Session) -> int:
+    links = db.scalars(
+        select(ContentMedia)
+        .join(MediaAsset, MediaAsset.id == ContentMedia.media_id)
+        .order_by(ContentMedia.content_id, ContentMedia.position, ContentMedia.id)
+    ).all()
+    groups: dict[tuple[int, str], list[tuple[ContentMedia, MediaAsset]]] = {}
+    for link in links:
+        asset = db.get(MediaAsset, link.media_id)
+        if asset is None:
+            continue
+        canonical = canonical_media_key(asset.source_url)
+        if canonical:
+            groups.setdefault((link.content_id, canonical), []).append((link, asset))
+
+    removed = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        keep_link, _keep_asset = max(
+            members,
+            key=lambda pair: ((pair[1].byte_size or 0), -(pair[0].position or 0)),
+        )
+        keep_link.position = min(link.position for link, _asset in members)
+        for link, _asset in members:
+            if link.id != keep_link.id:
+                db.delete(link)
+                removed += 1
+    db.flush()
+    return removed
 
 
 def image_perceptual_hash(asset: MediaAsset, media_root: Path) -> int | None:
