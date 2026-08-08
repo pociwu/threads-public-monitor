@@ -15,6 +15,7 @@ from app.models import (
     ContentVersion,
     InteractionSnapshot,
     Job,
+    MediaAsset,
     ProfileVersion,
     RelationshipChange,
     RelationshipMember,
@@ -31,7 +32,7 @@ from app.services.collector import (
     ThreadsCollector,
     content_fingerprint,
 )
-from app.services.media import MediaStore
+from app.services.media import MediaStore, media_identity
 from app.services.queue import enqueue_unique, next_account_due, next_batch_time, now_utc
 
 STREAM_TYPES = ("post", "reply", "repost", "quote")
@@ -194,10 +195,14 @@ class JobProcessor:
                     account_id=account.id,
                     relationship_type=relationship_type,
                     scan_date=scan_date,
-                    status="running",
+                    status="unavailable" if relationship_type == "following" else "running",
                 )
                 db.add(scan)
                 db.flush()
+            if relationship_type == "following":
+                scan.status = "unavailable"
+                scan.completed_at = now_utc()
+                continue
             if scan.status == "running":
                 enqueue_unique(
                     db,
@@ -415,19 +420,28 @@ class JobProcessor:
             content.suspected_removed = False
 
             media_assets = []
+            item_media_keys: set[tuple[str, str]] = set()
+            linked_media_keys = {
+                media_identity(asset)
+                for asset in db.scalars(
+                    select(MediaAsset)
+                    .join(ContentMedia, ContentMedia.media_id == MediaAsset.id)
+                    .where(ContentMedia.content_id == content.id)
+                ).all()
+            }
             for position, (url, media_type) in enumerate(item.media):
                 asset = self.media.register(db, url, media_type)
-                self.media.download(db, asset)
+                asset = self.media.download(db, asset)
+                key = media_identity(asset)
+                if key in item_media_keys:
+                    continue
+                item_media_keys.add(key)
                 media_assets.append(asset)
-                exists = db.scalar(
-                    select(ContentMedia).where(
-                        ContentMedia.content_id == content.id, ContentMedia.media_id == asset.id
-                    )
-                )
-                if not exists:
+                if key not in linked_media_keys:
                     db.add(
                         ContentMedia(content_id=content.id, media_id=asset.id, position=position)
                     )
+                    linked_media_keys.add(key)
 
             fingerprint = content_fingerprint(
                 item.text, [asset.sha256 or asset.source_key for asset in media_assets]

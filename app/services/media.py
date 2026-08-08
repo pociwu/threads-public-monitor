@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import MediaAsset
+from app.models import ContentMedia, MediaAsset
 
 
 def source_key(url: str) -> str:
@@ -33,6 +33,36 @@ def media_usage_percent(db: Session, settings: Settings) -> float:
         if settings.max_media_bytes
         else 100.0
     )
+
+
+def media_identity(asset: MediaAsset) -> tuple[str, str]:
+    if asset.sha256:
+        return ("sha256", asset.sha256)
+    if asset.local_path:
+        return ("local_path", asset.local_path)
+    return ("source_key", asset.source_key)
+
+
+def deduplicate_content_media_links(db: Session) -> int:
+    links = db.scalars(
+        select(ContentMedia)
+        .join(MediaAsset, MediaAsset.id == ContentMedia.media_id)
+        .order_by(ContentMedia.content_id, ContentMedia.position, ContentMedia.id)
+    ).all()
+    seen: set[tuple[int, tuple[str, str]]] = set()
+    removed = 0
+    for link in links:
+        asset = db.get(MediaAsset, link.media_id)
+        if asset is None:
+            continue
+        key = (link.content_id, media_identity(asset))
+        if key in seen:
+            db.delete(link)
+            removed += 1
+        else:
+            seen.add(key)
+    db.flush()
+    return removed
 
 
 class MediaStore:
@@ -104,7 +134,7 @@ class MediaStore:
                     asset.byte_size = duplicate.byte_size
                     asset.mime_type = duplicate.mime_type
                     asset.download_status = "downloaded"
-                    return asset
+                    return duplicate
 
                 content_type = response.headers.get("content-type", "").split(";", 1)[0] or None
                 extension = (

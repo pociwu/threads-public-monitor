@@ -11,9 +11,11 @@ from app.models import (
     Account,
     CollectionStream,
     Content,
+    ContentMedia,
     ContentVersion,
     InteractionSnapshot,
     Job,
+    MediaAsset,
     ProfileVersion,
     RelationshipChange,
     RelationshipMember,
@@ -103,7 +105,7 @@ def test_profile_job_versions_profile_and_schedules_stream(tmp_path) -> None:
         assert db.scalar(select(func.count(CollectionStream.id))) == 4
         assert db.scalar(select(func.count(Job.id)).where(Job.kind == "content")) == 1
         assert db.scalar(select(func.count(RelationshipScan.id))) == 2
-        assert db.scalar(select(func.count(Job.id)).where(Job.kind == "relationship")) == 2
+        assert db.scalar(select(func.count(Job.id)).where(Job.kind == "relationship")) == 1
 
 
 def test_successful_retry_clears_login_required_status(tmp_path) -> None:
@@ -134,6 +136,50 @@ def test_successful_retry_clears_login_required_status(tmp_path) -> None:
         assert account.status_message is None
 
 
+def test_profile_without_public_following_count_does_not_queue_following_list(tmp_path) -> None:
+    class FollowersOnlyCollector(FakeCollector):
+        profile = ProfileData(
+            username="example",
+            display_name="Example",
+            bio=None,
+            external_url=None,
+            avatar_url=None,
+            follower_count=51,
+            following_count=None,
+        )
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    with make_session() as db:
+        account = Account(username="example", status="pending")
+        db.add(account)
+        db.flush()
+        job = Job(account_id=account.id, kind="verify", status="running")
+        db.add(job)
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", FollowersOnlyCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        relationship_jobs = db.scalars(
+            select(Job).where(Job.kind == "relationship").order_by(Job.content_type)
+        ).all()
+        scans = db.scalars(
+            select(RelationshipScan).order_by(RelationshipScan.relationship_type)
+        ).all()
+        assert [item.content_type for item in relationship_jobs] == ["followers"]
+        assert [(scan.relationship_type, scan.status) for scan in scans] == [
+            ("followers", "running"),
+            ("following", "unavailable"),
+        ]
+
+
 def test_content_job_saves_version_and_changed_metrics(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -161,6 +207,66 @@ def test_content_job_saves_version_and_changed_metrics(tmp_path) -> None:
         metrics = db.scalar(select(InteractionSnapshot))
         assert metrics is not None
         assert metrics.like_count == 3
+
+
+def test_content_batch_links_canonical_media_only_once_for_duplicate_bytes(tmp_path) -> None:
+    class CanonicalMediaStore:
+        def __init__(self):
+            self.canonical = None
+
+        def register(self, db, url, media_type):
+            asset = MediaAsset(
+                source_url=url,
+                source_key=url,
+                media_type=media_type,
+            )
+            db.add(asset)
+            db.flush()
+            return asset
+
+        def download(self, _db, asset):
+            if self.canonical is not None:
+                return self.canonical
+            asset.sha256 = "a" * 64
+            asset.local_path = "aa/canonical.mp4"
+            asset.download_status = "downloaded"
+            self.canonical = asset
+            return asset
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        db.add(CollectionStream(account_id=account.id, content_type="post"))
+        processor = JobProcessor(settings)
+        processor.media = CanonicalMediaStore()
+        duplicate_media_item = ContentData(
+            threads_id="duplicate-media",
+            author_username="example",
+            content_type="post",
+            source_url="https://www.threads.com/@example/post/duplicate-media",
+            text="same video",
+            published_at=datetime(2026, 8, 8),
+            media=[
+                ("https://cdn.example/first.mp4", "video"),
+                ("https://cdn.example/second.mp4", "video"),
+            ],
+        )
+
+        processor._save_content_batch(db, account, "post", [duplicate_media_item])
+        db.flush()
+
+        content = db.scalar(select(Content).where(Content.threads_id == "duplicate-media"))
+        assert content is not None
+        links = db.scalars(
+            select(ContentMedia).where(ContentMedia.content_id == content.id)
+        ).all()
+        assert len(links) == 1
 
 
 def test_content_success_does_not_replace_last_scheduled_profile_visit(tmp_path) -> None:

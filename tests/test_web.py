@@ -181,3 +181,28 @@ def test_account_detail_shows_relationship_tabs_members_and_scan_status() -> Non
     finally:
         app.dependency_overrides.clear()
         db.close()
+
+
+def test_account_detail_marks_following_list_as_not_public() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        db.add(
+            RelationshipScan(
+                account_id=account.id,
+                relationship_type="following",
+                scan_date=date(2026, 8, 8),
+                status="unavailable",
+            )
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}?tab=following")
+
+        assert response.status_code == 200
+        assert "Threads 未公開" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()

@@ -53,7 +53,7 @@
 <section class="relationship-panel">
   <div class="section-heading"><h2>{{ '粉絲名單' if tab == 'followers' else '追蹤中名單' }}</h2><span class="muted">每批 {{ relationship_batch_size }} 人</span></div>
   {% if relationship_scan %}
-  <p class="scan-summary"><span class="status status-{{ 'succeeded' if relationship_scan.status == 'complete' else ('queued' if relationship_scan.status == 'running' else 'failed') }}">{{ {'complete':'本輪完成','running':'分批擷取中','failed':'本輪失敗'}.get(relationship_scan.status, relationship_scan.status) }}</span> 已擷取 {{ relationship_scan.collected_count }} 人 · 掃描日期 {{ relationship_scan.scan_date }}{% if relationship_scan.status != 'complete' %} · 未完成前不計算退出名單{% endif %}</p>
+  <p class="scan-summary"><span class="status status-{{ 'succeeded' if relationship_scan.status == 'complete' else ('queued' if relationship_scan.status == 'running' else ('muted' if relationship_scan.status == 'unavailable' else 'failed')) }}">{{ {'complete':'本輪完成','running':'分批擷取中','failed':'本輪失敗','unavailable':'Threads 未公開'}.get(relationship_scan.status, relationship_scan.status) }}</span> 已擷取 {{ relationship_scan.collected_count }} 人 · 掃描日期 {{ relationship_scan.scan_date }}{% if relationship_scan.status not in ['complete', 'unavailable'] %} · 未完成前不計算退出名單{% endif %}</p>
   {% else %}<p class="muted">尚未開始擷取；下次帳號拜訪後會建立第一輪名單。</p>{% endif %}
   <div class="member-grid">
     {% for member in relationship_members %}

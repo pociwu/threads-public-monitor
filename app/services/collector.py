@@ -390,8 +390,16 @@ class ThreadsCollector:
                   let complete = false;
 
                   for (let turn = 0; turn < 80; turn++) {
-                    for (const anchor of dialog.querySelectorAll('a[href^="/@"]')) {
-                      const match = (anchor.getAttribute('href') || '').match(/^\/@([^/?#]+)/);
+                    for (const anchor of dialog.querySelectorAll('a[href*="/@"]')) {
+                      let pathname = '';
+                      try {
+                        pathname = new URL(
+                          anchor.getAttribute('href') || anchor.href || '', location.origin
+                        ).pathname;
+                      } catch (_error) {
+                        continue;
+                      }
+                      const match = pathname.match(/^\/@([^/?#]+)/);
                       if (!match) continue;
                       const memberUsername = decodeURIComponent(match[1]).toLowerCase();
                       if (memberUsername === owner.toLowerCase() || seen.has(memberUsername)) continue;
