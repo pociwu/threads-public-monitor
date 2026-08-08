@@ -436,7 +436,9 @@ class ThreadsCollector:
                     const atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
                     if (atEnd && ordered.length === previousSize) stagnant += 1;
                     else stagnant = 0;
-                    if (atEnd && stagnant >= 2) {
+                    // Threads often renders an empty dialog before its member rows arrive.
+                    // Do not treat that transient state as a complete empty list.
+                    if (atEnd && stagnant >= 2 && (ordered.length > 0 || turn >= 12)) {
                       complete = true;
                       return {
                         members: afterCursor.slice(0, limit), complete,

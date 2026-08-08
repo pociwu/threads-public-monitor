@@ -1,6 +1,7 @@
 from datetime import date, datetime
 from unittest.mock import patch
 
+import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -364,6 +365,37 @@ def test_relationship_scans_create_baseline_then_daily_added_removed_diff(tmp_pa
         assert members["alice"].active is False
         assert members["bob"].active is True
         assert members["carol"].active is True
+
+
+def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(
+            username="example", status="active", follower_count=51
+        )
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 8),
+            status="running",
+        )
+        db.add(scan)
+        db.flush()
+
+        with pytest.raises(CollectionError, match="粉絲清單尚未載入"):
+            processor._save_relationship_batch(
+                db, account, scan, relationship_batch(complete=True)
+            )
+
+        assert scan.status == "running"
+        assert scan.collected_count == 0
 
 
 def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:

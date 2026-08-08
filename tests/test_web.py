@@ -197,12 +197,21 @@ def test_account_detail_marks_following_list_as_not_public() -> None:
                 status="unavailable",
             )
         )
+        db.add(
+            RelationshipMember(
+                account_id=account.id,
+                relationship_type="following",
+                username="known_user",
+                active=True,
+            )
+        )
         db.commit()
 
         response = client.get(f"/accounts/{account.id}?tab=following")
 
         assert response.status_code == 200
-        assert "Threads 未公開" in response.text
+        assert "Threads 目前未公開" in response.text
+        assert "顯示最後已知名單 1 人" in response.text
     finally:
         app.dependency_overrides.clear()
         db.close()

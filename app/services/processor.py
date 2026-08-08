@@ -203,6 +203,13 @@ class JobProcessor:
                 scan.status = "unavailable"
                 scan.completed_at = now_utc()
                 continue
+            if scan.status == "failed" or (
+                scan.status == "complete"
+                and scan.collected_count == 0
+                and (account.follower_count or 0) > 0
+            ):
+                scan.status = "running"
+                scan.completed_at = None
             if scan.status == "running":
                 enqueue_unique(
                     db,
@@ -287,6 +294,13 @@ class JobProcessor:
             )
             or 0
         )
+        if (
+            batch.complete
+            and scan.relationship_type == "followers"
+            and scan.collected_count == 0
+            and (account.follower_count or 0) > 0
+        ):
+            raise CollectionError("粉絲清單尚未載入，拒絕將非空帳號記為空名單")
         if batch.complete:
             self._complete_relationship_scan(db, account, scan)
         return saved
