@@ -163,11 +163,25 @@ class ThreadsCollector:
                     const body = document.body.innerText || '';
                     const headings = [...document.querySelectorAll('h1')]
                       .map(e => e.textContent?.trim()).filter(Boolean);
-                    const avatar = [...document.querySelectorAll('img')].find(img =>
+                    const matchingAvatar = [...document.querySelectorAll('img')].find(img =>
                       (img.alt || '').toLowerCase().includes(username.toLowerCase()) &&
                       ((img.alt || '').includes('大頭貼') || (img.alt || '').toLowerCase().includes('profile'))
                     );
                     const links = [...document.querySelectorAll('a')];
+                    const ogImage = document.querySelector('meta[property="og:image"]')?.content;
+                    const ogTitle = document.querySelector('meta[property="og:title"]')?.content;
+                    const ogDescription = document.querySelector(
+                      'meta[property="og:description"]'
+                    )?.content;
+                    const avatar = matchingAvatar || [...document.querySelectorAll('img')].find(img =>
+                      (img.alt || '').toLowerCase().includes(username.toLowerCase())
+                    );
+                    const identityUrls = [
+                      document.querySelector('link[rel="canonical"]')?.href,
+                      document.querySelector('meta[property="og:url"]')?.content,
+                      ...links.map(link => link.href)
+                    ].filter(Boolean);
+                    const profileAnchorUrls = links.map(link => link.href).filter(Boolean);
                     const controls = [...document.querySelectorAll('a,button,[role="button"]')]
                       .map(el => [el.getAttribute('aria-label') || '', el.textContent || '']
                         .join(' ').replace(/\s+/g, ' ').trim())
@@ -182,7 +196,17 @@ class ThreadsCollector:
                     return {
                       body,
                       headings,
-                      avatarUrl: avatar?.currentSrc || avatar?.src || null,
+                      profilePaths: identityUrls.map(value => {
+                        try { return new URL(value, location.origin).pathname; }
+                        catch { return ''; }
+                      }).filter(Boolean),
+                      profileAnchorPaths: profileAnchorUrls.map(value => {
+                        try { return new URL(value, location.origin).pathname; }
+                        catch { return ''; }
+                      }).filter(Boolean),
+                      avatarUrl: avatar?.currentSrc || avatar?.src || ogImage || null,
+                      ogTitle: ogTitle || null,
+                      ogDescription: ogDescription || null,
                       followerText: follower || null,
                       followingText: following || null,
                       externalUrl: external?.href || null,
@@ -192,13 +216,17 @@ class ThreadsCollector:
                 username,
             )
             body = raw.get("body", "")
+            profile_source = f"{body}\n{raw.get('ogDescription') or ''}"
             if "找不到此頁面" in body or "page isn't available" in body.lower():
                 raise CollectionError("帳號不存在或無法公開存取")
             if "這是私人帳號" in body or "this profile is private" in body.lower():
                 raise CollectionError("此帳號為私人帳號，不在監看範圍")
+            if not self._profile_matches_username(raw, username):
+                raise CollectionError("Threads 回應未包含指定帳號的個人檔案身分")
             headings = [
                 item for item in raw.get("headings", []) if item.lower() != username.lower()
             ]
+            display_name = self._profile_display_name(raw, username, headings)
             profile_lines = [
                 line.strip() for line in raw.get("profileText", "").splitlines() if line.strip()
             ]
@@ -209,9 +237,10 @@ class ThreadsCollector:
                 if line.lower() not in excluded
                 and not re.search(r"粉絲|followers?|追蹤|following", line, re.I)
             ]
+            body = profile_source
             return ProfileData(
                 username=username,
-                display_name=headings[0] if headings else None,
+                display_name=display_name,
                 bio="\n".join(bio_lines[:4]) or None,
                 external_url=raw.get("externalUrl"),
                 avatar_url=raw.get("avatarUrl"),
@@ -224,6 +253,35 @@ class ThreadsCollector:
             )
         finally:
             page.close()
+
+    @staticmethod
+    def _profile_matches_username(raw: dict[str, Any], username: str) -> bool:
+        expected = f"/@{username}".casefold().rstrip("/")
+        has_identity_path = any(
+            str(path).casefold().rstrip("/") == expected
+            for path in raw.get("profilePaths", [])
+        )
+        has_profile_control = bool(raw.get("followerText")) or any(
+            str(path).casefold().rstrip("/") == expected
+            for path in raw.get("profileAnchorPaths", [])
+        )
+        return (
+            has_identity_path
+            and has_profile_control
+            and username.casefold() in str(raw.get("body", "")).casefold()
+        )
+
+    @staticmethod
+    def _profile_display_name(
+        raw: dict[str, Any], username: str, headings: list[str]
+    ) -> str | None:
+        if headings:
+            return headings[0]
+        title = str(raw.get("ogTitle") or "").strip()
+        match = re.match(rf"^(.*?)\s*\(@{re.escape(username)}\)", title, re.I)
+        if match and match.group(1).strip().casefold() != username.casefold():
+            return match.group(1).strip()
+        return None
 
     def collect_content(
         self,
@@ -388,6 +446,19 @@ class ThreadsCollector:
                   let stagnant = 0;
                   let previousSize = 0;
                   let complete = false;
+                  const avatarUrlFrom = root => {
+                    const image = root.querySelector('img[src],img[srcset]');
+                    if (image?.currentSrc || image?.src) return image.currentSrc || image.src;
+                    const svgImage = root.querySelector('image[href]');
+                    const svgHref = svgImage?.href?.baseVal || svgImage?.getAttribute('href');
+                    if (svgHref) return svgHref;
+                    for (const element of [root, ...root.querySelectorAll('*')]) {
+                      const background = getComputedStyle(element).backgroundImage || '';
+                      const match = background.match(/^url\(["']?(.*?)["']?\)$/);
+                      if (match?.[1] && !match[1].startsWith('data:')) return match[1];
+                    }
+                    return null;
+                  };
 
                   for (let turn = 0; turn < 80; turn++) {
                     for (const anchor of dialog.querySelectorAll('a[href*="/@"]')) {
@@ -404,11 +475,11 @@ class ThreadsCollector:
                       const memberUsername = decodeURIComponent(match[1]).toLowerCase();
                       if (memberUsername === owner.toLowerCase() || seen.has(memberUsername)) continue;
                       let item = anchor;
-                      for (let level = 0; level < 5 && item.parentElement; level++) {
+                      for (let level = 0; level < 10 && item.parentElement; level++) {
                         item = item.parentElement;
-                        if (item.querySelector('img') && item.innerText.trim().length > 0) break;
+                        if (avatarUrlFrom(item) && item.innerText.trim().length > 0) break;
                       }
-                      const image = item.querySelector('img');
+                      const avatarUrl = avatarUrlFrom(item);
                       const lines = (item.innerText || '').split('\n').map(v => v.trim()).filter(Boolean);
                       const displayName = lines.find(line =>
                         line.toLowerCase() !== memberUsername &&
@@ -419,7 +490,7 @@ class ThreadsCollector:
                       ordered.push({
                         username: memberUsername,
                         displayName,
-                        avatarUrl: image?.currentSrc || image?.src || null
+                        avatarUrl
                       });
                       if (memberUsername === (cursor || '').toLowerCase()) cursorFound = true;
                     }

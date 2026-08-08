@@ -87,3 +87,31 @@ def test_collector_stops_playwright_when_browser_launch_fails(monkeypatch, tmp_p
 
     assert runtime.stopped is True
     assert collector._playwright is None
+
+
+def test_profile_identity_requires_requested_threads_account() -> None:
+    assert ThreadsCollector._profile_matches_username(
+        {
+            "profilePaths": ["/@xin.121"],
+            "profileAnchorPaths": ["/@xin.121"],
+            "body": "xin.121\n51 followers",
+        },
+        "xin.121",
+    )
+    assert not ThreadsCollector._profile_matches_username(
+        {
+            "profilePaths": ["/@xin.121"],
+            "profileAnchorPaths": [],
+            "body": "xin.121. Something went wrong. Visit the Instagram help centre.",
+        },
+        "xin.121",
+    )
+
+
+def test_profile_display_name_falls_back_to_open_graph_title() -> None:
+    assert (
+        ThreadsCollector._profile_display_name(
+            {"ogTitle": "小欣 (@xin.121) · Threads"}, "xin.121", []
+        )
+        == "小欣"
+    )

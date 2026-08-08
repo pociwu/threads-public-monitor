@@ -32,7 +32,7 @@ from app.services.collector import (
     ThreadsCollector,
     content_fingerprint,
 )
-from app.services.media import MediaStore, media_identity
+from app.services.media import MediaStore, media_equivalent, media_identity
 from app.services.queue import enqueue_unique, next_account_due, next_batch_time, now_utc
 
 STREAM_TYPES = ("post", "reply", "repost", "quote")
@@ -435,27 +435,34 @@ class JobProcessor:
 
             media_assets = []
             item_media_keys: set[tuple[str, str]] = set()
-            linked_media_keys = {
-                media_identity(asset)
-                for asset in db.scalars(
+            linked_media_assets = db.scalars(
                     select(MediaAsset)
                     .join(ContentMedia, ContentMedia.media_id == MediaAsset.id)
                     .where(ContentMedia.content_id == content.id)
                 ).all()
-            }
+            linked_media_keys = {media_identity(asset) for asset in linked_media_assets}
             for position, (url, media_type) in enumerate(item.media):
                 asset = self.media.register(db, url, media_type)
                 asset = self.media.download(db, asset)
                 key = media_identity(asset)
-                if key in item_media_keys:
+                if key in item_media_keys or any(
+                    media_equivalent(asset, existing, self.settings.media_root)
+                    for existing in media_assets
+                ):
                     continue
                 item_media_keys.add(key)
                 media_assets.append(asset)
                 if key not in linked_media_keys:
+                    if any(
+                        media_equivalent(asset, existing, self.settings.media_root)
+                        for existing in linked_media_assets
+                    ):
+                        continue
                     db.add(
                         ContentMedia(content_id=content.id, media_id=asset.id, position=position)
                     )
                     linked_media_keys.add(key)
+                    linked_media_assets.append(asset)
 
             fingerprint = content_fingerprint(
                 item.text, [asset.sha256 or asset.source_key for asset in media_assets]

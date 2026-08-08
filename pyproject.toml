@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "threads-public-monitor"
-version = "0.1.15"
+version = "0.1.16"
 description = "A private-network monitor for public Threads accounts"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,6 +14,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "jinja2>=3.1,<4",
+  "pillow>=11.1,<13",
   "playwright>=1.51,<2",
   "pydantic-settings>=2.7,<3",
   "python-multipart>=0.0.20,<1",

@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from PIL import Image, ImageOps
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -43,24 +44,59 @@ def media_identity(asset: MediaAsset) -> tuple[str, str]:
     return ("source_key", asset.source_key)
 
 
-def deduplicate_content_media_links(db: Session) -> int:
+def image_perceptual_hash(asset: MediaAsset, media_root: Path) -> int | None:
+    if asset.media_type != "image" or not asset.local_path:
+        return None
+    try:
+        with Image.open(media_root / asset.local_path) as source:
+            image = ImageOps.exif_transpose(source).convert("L").resize((17, 16))
+            pixels = image.tobytes()
+    except (OSError, ValueError):
+        return None
+    result = 0
+    for row in range(16):
+        offset = row * 17
+        for column in range(16):
+            result = (result << 1) | int(
+                pixels[offset + column] > pixels[offset + column + 1]
+            )
+    return result
+
+
+def media_equivalent(first: MediaAsset, second: MediaAsset, media_root: Path) -> bool:
+    if first.sha256 and first.sha256 == second.sha256:
+        return True
+    if first.media_type != "image" or second.media_type != "image":
+        return False
+    first_hash = image_perceptual_hash(first, media_root)
+    second_hash = image_perceptual_hash(second, media_root)
+    return first_hash is not None and second_hash is not None and (first_hash ^ second_hash).bit_count() <= 4
+
+
+def deduplicate_content_media_links(db: Session, media_root: Path | None = None) -> int:
     links = db.scalars(
         select(ContentMedia)
         .join(MediaAsset, MediaAsset.id == ContentMedia.media_id)
         .order_by(ContentMedia.content_id, ContentMedia.position, ContentMedia.id)
     ).all()
     seen: set[tuple[int, tuple[str, str]]] = set()
+    kept_by_content: dict[int, list[MediaAsset]] = {}
     removed = 0
     for link in links:
         asset = db.get(MediaAsset, link.media_id)
         if asset is None:
             continue
         key = (link.content_id, media_identity(asset))
-        if key in seen:
+        visually_duplicated = media_root is not None and any(
+            media_equivalent(asset, kept, media_root)
+            for kept in kept_by_content.get(link.content_id, [])
+        )
+        if key in seen or visually_duplicated:
             db.delete(link)
             removed += 1
         else:
             seen.add(key)
+            kept_by_content.setdefault(link.content_id, []).append(asset)
     db.flush()
     return removed
 
