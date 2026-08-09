@@ -503,6 +503,38 @@ def test_follower_batch_discovers_following_count_and_queues_following_scan(tmp_
         assert queued is not None
 
 
+def test_relationship_scan_cannot_complete_before_known_total(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 9),
+            status="running",
+        )
+        db.add(scan)
+        db.flush()
+
+        processor._save_relationship_batch(
+            db,
+            account,
+            scan,
+            relationship_batch("alice", "bob", complete=True),
+        )
+        db.flush()
+
+        assert scan.collected_count == 2
+        assert scan.status == "running"
+
+
 def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:
     class FailingRelationshipCollector(FakeCollector):
         def collect_relationships(self, *_args, **_kwargs):

@@ -87,6 +87,16 @@ class JobProcessor:
                     scan = self._current_relationship_scan(db, account, job.content_type)
                     if not scan:
                         raise CollectionError("找不到可執行的關係名單掃描")
+                    seen_usernames = set(
+                        db.scalars(
+                            select(RelationshipMember.username)
+                            .join(
+                                RelationshipScanMember,
+                                RelationshipScanMember.member_id == RelationshipMember.id,
+                            )
+                            .where(RelationshipScanMember.scan_id == scan.id)
+                        ).all()
+                    )
                     batch = collector.collect_relationships(
                         account.username,
                         job.content_type,
@@ -97,6 +107,7 @@ class JobProcessor:
                             if job.content_type == "followers"
                             else account.following_count
                         ),
+                        seen_usernames=seen_usernames,
                     )
                     run.item_count = self._save_relationship_batch(db, account, scan, batch)
                 else:
@@ -216,10 +227,15 @@ class JobProcessor:
             if relationship_type == "following" and scan.status == "unavailable":
                 scan.status = "running"
                 scan.completed_at = None
+            expected_count = (
+                account.follower_count
+                if relationship_type == "followers"
+                else account.following_count
+            )
             if scan.status == "failed" or (
                 scan.status == "complete"
-                and scan.collected_count == 0
-                and (account.follower_count or 0) > 0
+                and expected_count is not None
+                and scan.collected_count < expected_count
             ):
                 scan.status = "running"
                 scan.completed_at = None
@@ -319,7 +335,13 @@ class JobProcessor:
             and (account.follower_count or 0) > 0
         ):
             raise CollectionError("粉絲清單尚未載入，拒絕將非空帳號記為空名單")
-        if batch.complete:
+        expected_count = (
+            account.follower_count
+            if scan.relationship_type == "followers"
+            else account.following_count
+        )
+        reached_known_total = expected_count is None or scan.collected_count >= expected_count
+        if batch.complete and reached_known_total:
             self._complete_relationship_scan(db, account, scan)
         return saved
 

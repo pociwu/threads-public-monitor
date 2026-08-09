@@ -109,6 +109,24 @@ def test_positive_follower_count_waits_for_a_visible_relationship_row(tmp_path) 
     )
 
 
+def test_relationship_control_retries_until_threads_renders_it() -> None:
+    class FakePage:
+        def __init__(self):
+            self.results = iter([False, False, True])
+            self.waits = []
+
+        def evaluate(self, _script):
+            return next(self.results)
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    page = FakePage()
+
+    assert ThreadsCollector._click_when_available(page, "script", attempts=60) is True
+    assert page.waits == [500, 500]
+
+
 def test_content_text_excludes_trailing_threads_ui_numbers() -> None:
     raw = "example\n2026-6-10\n杜拜巧克力＝杜力\n1\n/\n2\n12 萬\n731\n4,014\n2.3 萬"
     assert ThreadsCollector._clean_content_text(raw, "example") == "杜拜巧克力＝杜力"

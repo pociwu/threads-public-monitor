@@ -392,12 +392,14 @@ class ThreadsCollector:
         limit: int = 5,
         cursor: str | None = None,
         expected_count: int | None = None,
+        seen_usernames: set[str] | None = None,
     ) -> RelationshipBatch:
         if relationship_type not in {"followers", "following"}:
             raise CollectionError(f"未知關係類型：{relationship_type}")
         page = self._page(f"https://www.threads.com/@{username}")
         try:
-            opened = page.evaluate(
+            opened = self._click_when_available(
+                page,
                 r"""() => {
                   const controls = [...document.querySelectorAll('a,button,[role="button"]')];
                   const target = controls.find(el => {
@@ -408,11 +410,12 @@ class ThreadsCollector:
                   if (!target) return false;
                   target.click();
                   return true;
-                }"""
+                }""",
             )
             if opened and relationship_type == "following":
                 page.wait_for_timeout(800)
-                opened = page.evaluate(
+                opened = self._click_when_available(
+                    page,
                     r"""() => {
                       const dialog = document.querySelector(
                         '[role="dialog"],[aria-modal="true"]'
@@ -425,7 +428,7 @@ class ThreadsCollector:
                       if (!target) return false;
                       target.click();
                       return true;
-                    }"""
+                    }""",
                 )
             if not opened:
                 raise CollectionError(
@@ -453,7 +456,7 @@ class ThreadsCollector:
                 self._save_relationship_diagnostic(page, username, relationship_type)
                 raise CollectionError("Threads 粉絲清單載入逾時，未取得任何成員") from exc
             raw: dict[str, Any] = page.evaluate(
-                r"""async ({owner, limit, cursor, expectedNonempty}) => {
+                r"""async ({owner, limit, cursor, expectedCount, seenUsernames}) => {
                   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
                   const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
                   if (!dialog) {
@@ -466,6 +469,9 @@ class ThreadsCollector:
                   )[0] || dialog;
                   const ordered = [];
                   const seen = new Set();
+                  const previouslySaved = new Set(
+                    (seenUsernames || []).map(value => value.toLowerCase())
+                  );
                   let cursorFound = !cursor;
                   let stagnant = 0;
                   let previousSize = 0;
@@ -519,10 +525,11 @@ class ThreadsCollector:
                       if (memberUsername === (cursor || '').toLowerCase()) cursorFound = true;
                     }
 
-                    const afterCursor = cursorFound
+                    const afterCursor = (cursorFound
                       ? ordered.slice(cursor ? ordered.findIndex(m => m.username === cursor.toLowerCase()) + 1 : 0)
-                      : [];
-                    if (afterCursor.length > limit) {
+                      : ordered
+                    ).filter(member => !previouslySaved.has(member.username));
+                    if (afterCursor.length >= limit) {
                       return {
                         members: afterCursor.slice(0, limit), complete: false,
                         cursorFound, available: true
@@ -533,9 +540,11 @@ class ThreadsCollector:
                     else stagnant = 0;
                     // Threads often renders an empty dialog before its member rows arrive.
                     // Do not treat that transient state as a complete empty list.
-                    if (atEnd && stagnant >= 2 && (
-                      ordered.length > 0 || (!expectedNonempty && turn >= 12)
-                    )) {
+                    const reachedKnownTotal = expectedCount > 0 && ordered.length >= expectedCount;
+                    const reachedUnknownEnd = !expectedCount && (
+                      ordered.length > 0 || turn >= 12
+                    );
+                    if (atEnd && stagnant >= 2 && (reachedKnownTotal || reachedUnknownEnd)) {
                       complete = true;
                       return {
                         members: afterCursor.slice(0, limit), complete,
@@ -550,22 +559,23 @@ class ThreadsCollector:
                     scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
                     await sleep(450);
                   }
-                  const start = cursor
+                  const start = cursorFound && cursor
                     ? ordered.findIndex(m => m.username === cursor.toLowerCase()) + 1 : 0;
-                  const members = cursorFound ? ordered.slice(start, start + limit) : [];
+                  const members = ordered.slice(start)
+                    .filter(member => !previouslySaved.has(member.username))
+                    .slice(0, limit);
                   return {members, complete: false, cursorFound, available: true};
                 }""",
                 {
                     "owner": username,
                     "limit": limit,
                     "cursor": cursor,
-                    "expectedNonempty": bool(expected_count and expected_count > 0),
+                    "expectedCount": expected_count or 0,
+                    "seenUsernames": sorted(seen_usernames or set()),
                 },
             )
             if not raw.get("available", True):
                 raise CollectionError("Threads 名單視窗未成功開啟")
-            if cursor and not raw.get("cursorFound"):
-                raise CollectionError("Threads 關係名單已變動，無法延續本次分批游標")
             if not raw.get("members"):
                 self._save_relationship_diagnostic(page, username, relationship_type)
             members = [
@@ -586,6 +596,15 @@ class ThreadsCollector:
             )
         finally:
             page.close()
+
+    @staticmethod
+    def _click_when_available(page: Page, script: str, attempts: int = 60) -> bool:
+        for attempt in range(attempts):
+            if page.evaluate(script):
+                return True
+            if attempt < attempts - 1:
+                page.wait_for_timeout(500)
+        return False
 
     @staticmethod
     def _wait_for_relationship_rows(page: Page, expected_count: int | None) -> None:
