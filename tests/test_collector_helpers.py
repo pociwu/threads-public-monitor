@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from app.config import Settings
@@ -35,6 +38,43 @@ def test_content_fingerprint_is_order_independent_for_media() -> None:
     second = content_fingerprint("hello", ["a", "b"])
     assert first == second
     assert first != content_fingerprint("changed", ["a", "b"])
+
+
+def test_empty_relationship_diagnostic_keeps_bounded_latest_artifacts(tmp_path) -> None:
+    class FakePage:
+        def evaluate(self, _script):
+            return {
+                "url": "https://www.threads.com/@example",
+                "title": "Threads",
+                "dialogHtml": "<div role=\"dialog\">changed DOM</div>",
+                "dialogLinks": [],
+                "dialogControls": [],
+                "dialogImages": [],
+            }
+
+        def screenshot(self, *, path, full_page):
+            assert full_page is True
+            Path(path).write_bytes(b"png")
+
+    settings = Settings(
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    collector = ThreadsCollector(settings)
+
+    collector._save_relationship_diagnostic(FakePage(), "example", "followers")
+
+    debug_dir = tmp_path / "debug"
+    json_path = debug_dir / "relationship-example-followers-latest.json"
+    png_path = debug_dir / "relationship-example-followers-latest.png"
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["dialogHtml"] == '<div role="dialog">changed DOM</div>'
+    assert payload["username"] == "example"
+    assert png_path.read_bytes() == b"png"
+    assert sorted(path.name for path in debug_dir.iterdir()) == [
+        "relationship-example-followers-latest.json",
+        "relationship-example-followers-latest.png",
+    ]
 
 
 def test_content_text_excludes_trailing_threads_ui_numbers() -> None:

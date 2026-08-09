@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -535,6 +535,8 @@ class ThreadsCollector:
                 raise CollectionError("Threads 名單視窗未成功開啟")
             if cursor and not raw.get("cursorFound"):
                 raise CollectionError("Threads 關係名單已變動，無法延續本次分批游標")
+            if not raw.get("members"):
+                self._save_relationship_diagnostic(page, username, relationship_type)
             members = [
                 RelationshipMemberData(
                     username=item["username"],
@@ -551,6 +553,60 @@ class ThreadsCollector:
             )
         finally:
             page.close()
+
+    def _save_relationship_diagnostic(
+        self, page: Page, username: str, relationship_type: str
+    ) -> None:
+        """Keep one bounded diagnostic artifact when Threads renders no member rows."""
+        safe_username = re.sub(r"[^a-zA-Z0-9._-]", "_", username)
+        debug_dir = self.settings.media_root.parent / "debug"
+        json_path = debug_dir / f"relationship-{safe_username}-{relationship_type}-latest.json"
+        png_path = debug_dir / f"relationship-{safe_username}-{relationship_type}-latest.png"
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            snapshot = page.evaluate(
+                r"""() => {
+                  const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
+                  const describe = el => ({
+                    tag: el.tagName,
+                    role: el.getAttribute('role'),
+                    href: el.getAttribute('href'),
+                    ariaLabel: el.getAttribute('aria-label'),
+                    text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()
+                      .slice(0, 500)
+                  });
+                  return {
+                    url: location.href,
+                    title: document.title,
+                    dialogHtml: dialog?.outerHTML?.slice(0, 2_000_000) || null,
+                    dialogLinks: dialog
+                      ? [...dialog.querySelectorAll('a[href]')].slice(0, 200).map(describe)
+                      : [],
+                    dialogControls: dialog
+                      ? [...dialog.querySelectorAll('button,[role="button"]')]
+                        .slice(0, 200).map(describe)
+                      : [],
+                    dialogImages: dialog
+                      ? [...dialog.querySelectorAll('img,image')].slice(0, 200).map(el => ({
+                        tag: el.tagName,
+                        src: el.currentSrc || el.src || el.getAttribute('href'),
+                        alt: el.getAttribute('alt'),
+                        ariaLabel: el.getAttribute('aria-label')
+                      }))
+                      : []
+                  };
+                }"""
+            )
+            snapshot["capturedAt"] = datetime.now(UTC).isoformat(timespec="seconds")
+            snapshot["username"] = username
+            snapshot["relationshipType"] = relationship_type
+            json_path.write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            page.screenshot(path=str(png_path), full_page=True)
+        except Exception:
+            # Diagnostics must never replace the original collection result.
+            return
 
     @staticmethod
     def _clean_content_text(value: str, author: str) -> str | None:
