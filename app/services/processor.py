@@ -93,7 +93,9 @@ class JobProcessor:
                         self.settings.relationship_batch_size,
                         cursor=scan.cursor,
                         expected_count=(
-                            account.follower_count if job.content_type == "followers" else None
+                            account.follower_count
+                            if job.content_type == "followers"
+                            else account.following_count
                         ),
                     )
                     run.item_count = self._save_relationship_batch(db, account, scan, batch)
@@ -207,10 +209,13 @@ class JobProcessor:
                 )
                 db.add(scan)
                 db.flush()
-            if relationship_type == "following":
+            if relationship_type == "following" and account.following_count is None:
                 scan.status = "unavailable"
                 scan.completed_at = now_utc()
                 continue
+            if relationship_type == "following" and scan.status == "unavailable":
+                scan.status = "running"
+                scan.completed_at = None
             if scan.status == "failed" or (
                 scan.status == "complete"
                 and scan.collected_count == 0
@@ -252,6 +257,11 @@ class JobProcessor:
     ) -> int:
         now = now_utc()
         saved = 0
+        if batch.follower_count is not None:
+            account.follower_count = batch.follower_count
+        if batch.following_count is not None:
+            account.following_count = batch.following_count
+            self._activate_following_scan(db, account, batch.following_count)
         for item in batch.members:
             avatar_id = None
             member = db.scalar(
@@ -312,6 +322,43 @@ class JobProcessor:
         if batch.complete:
             self._complete_relationship_scan(db, account, scan)
         return saved
+
+    def _activate_following_scan(
+        self, db: Session, account: Account, following_count: int
+    ) -> None:
+        scan_date = datetime.now(self.settings.tz).date()
+        scan = db.scalar(
+            select(RelationshipScan).where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == "following",
+                RelationshipScan.scan_date == scan_date,
+            )
+        )
+        if scan is None:
+            scan = RelationshipScan(
+                account_id=account.id,
+                relationship_type="following",
+                scan_date=scan_date,
+                status="running" if following_count > 0 else "complete",
+                completed_at=None if following_count > 0 else now_utc(),
+            )
+            db.add(scan)
+            db.flush()
+        elif following_count > 0 and scan.status in {"unavailable", "failed"}:
+            scan.status = "running"
+            scan.completed_at = None
+        elif following_count == 0:
+            scan.status = "complete"
+            scan.completed_at = now_utc()
+        if scan.status == "running":
+            enqueue_unique(
+                db,
+                kind="relationship",
+                account_id=account.id,
+                content_type="following",
+                priority=40,
+                not_before=next_batch_time(self.settings),
+            )
 
     @staticmethod
     def _complete_relationship_scan(

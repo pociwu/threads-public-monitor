@@ -106,7 +106,7 @@ def test_profile_job_versions_profile_and_schedules_stream(tmp_path) -> None:
         assert db.scalar(select(func.count(CollectionStream.id))) == 4
         assert db.scalar(select(func.count(Job.id)).where(Job.kind == "content")) == 1
         assert db.scalar(select(func.count(RelationshipScan.id))) == 2
-        assert db.scalar(select(func.count(Job.id)).where(Job.kind == "relationship")) == 1
+        assert db.scalar(select(func.count(Job.id)).where(Job.kind == "relationship")) == 2
 
 
 def test_successful_retry_clears_login_required_status(tmp_path) -> None:
@@ -451,6 +451,56 @@ def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> 
 
         assert scan.status == "running"
         assert scan.collected_count == 0
+
+
+def test_follower_batch_discovers_following_count_and_queues_following_scan(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        follower_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 9),
+            status="running",
+        )
+        following_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="following",
+            scan_date=date(2026, 8, 9),
+            status="unavailable",
+        )
+        db.add_all([follower_scan, following_scan])
+        db.flush()
+
+        batch = RelationshipBatch(
+            members=[RelationshipMemberData("alice", "Alice", None)],
+            cursor="alice",
+            complete=False,
+            following_count=149,
+        )
+        processor._save_relationship_batch(db, account, follower_scan, batch)
+        db.flush()
+
+        assert account.following_count == 149
+        assert following_scan.status == "running"
+        queued = db.scalar(
+            select(Job).where(
+                Job.account_id == account.id,
+                Job.kind == "relationship",
+                Job.content_type == "following",
+                Job.status == "queued",
+            )
+        )
+        assert queued is not None
 
 
 def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:

@@ -69,6 +69,8 @@ class RelationshipBatch:
     members: list[RelationshipMemberData]
     cursor: str | None
     complete: bool
+    follower_count: int | None = None
+    following_count: int | None = None
 
 
 def parse_count(value: str | None) -> int | None:
@@ -430,6 +432,21 @@ class ThreadsCollector:
                     "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
                 )
             page.wait_for_timeout(1000)
+            relationship_counts: dict[str, str | None] = page.evaluate(
+                r"""() => {
+                  const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
+                  const labels = dialog
+                    ? [...dialog.querySelectorAll('a,button,[role="button"]')].map(el =>
+                        [el.getAttribute('aria-label') || '', el.textContent || '']
+                          .join(' ').replace(/\s+/g, ' ').trim()
+                      )
+                    : [];
+                  return {
+                    followers: labels.find(text => /粉絲|followers?/i.test(text)) || null,
+                    following: labels.find(text => /追蹤中|following/i.test(text)) || null
+                  };
+                }"""
+            )
             try:
                 self._wait_for_relationship_rows(page, expected_count)
             except PlaywrightTimeoutError as exc:
@@ -564,6 +581,8 @@ class ThreadsCollector:
                 members=members,
                 cursor=members[-1].username if members else cursor,
                 complete=bool(raw.get("complete")),
+                follower_count=parse_count(relationship_counts.get("followers")),
+                following_count=parse_count(relationship_counts.get("following")),
             )
         finally:
             page.close()
