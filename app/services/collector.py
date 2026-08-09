@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.config import Settings
 
@@ -388,6 +389,7 @@ class ThreadsCollector:
         relationship_type: str,
         limit: int = 5,
         cursor: str | None = None,
+        expected_count: int | None = None,
     ) -> RelationshipBatch:
         if relationship_type not in {"followers", "following"}:
             raise CollectionError(f"未知關係類型：{relationship_type}")
@@ -428,8 +430,13 @@ class ThreadsCollector:
                     "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
                 )
             page.wait_for_timeout(1000)
+            try:
+                self._wait_for_relationship_rows(page, expected_count)
+            except PlaywrightTimeoutError as exc:
+                self._save_relationship_diagnostic(page, username, relationship_type)
+                raise CollectionError("Threads 粉絲清單載入逾時，未取得任何成員") from exc
             raw: dict[str, Any] = page.evaluate(
-                r"""async ({owner, limit, cursor}) => {
+                r"""async ({owner, limit, cursor, expectedNonempty}) => {
                   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
                   const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
                   if (!dialog) {
@@ -509,7 +516,9 @@ class ThreadsCollector:
                     else stagnant = 0;
                     // Threads often renders an empty dialog before its member rows arrive.
                     // Do not treat that transient state as a complete empty list.
-                    if (atEnd && stagnant >= 2 && (ordered.length > 0 || turn >= 12)) {
+                    if (atEnd && stagnant >= 2 && (
+                      ordered.length > 0 || (!expectedNonempty && turn >= 12)
+                    )) {
                       complete = true;
                       return {
                         members: afterCursor.slice(0, limit), complete,
@@ -529,7 +538,12 @@ class ThreadsCollector:
                   const members = cursorFound ? ordered.slice(start, start + limit) : [];
                   return {members, complete: false, cursorFound, available: true};
                 }""",
-                {"owner": username, "limit": limit, "cursor": cursor},
+                {
+                    "owner": username,
+                    "limit": limit,
+                    "cursor": cursor,
+                    "expectedNonempty": bool(expected_count and expected_count > 0),
+                },
             )
             if not raw.get("available", True):
                 raise CollectionError("Threads 名單視窗未成功開啟")
@@ -553,6 +567,14 @@ class ThreadsCollector:
             )
         finally:
             page.close()
+
+    @staticmethod
+    def _wait_for_relationship_rows(page: Page, expected_count: int | None) -> None:
+        if not expected_count or expected_count <= 0:
+            return
+        page.locator(
+            '[role="dialog"] a[href*="/@"], [aria-modal="true"] a[href*="/@"]'
+        ).first.wait_for(state="visible", timeout=30_000)
 
     def _save_relationship_diagnostic(
         self, page: Page, username: str, relationship_type: str

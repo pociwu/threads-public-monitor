@@ -92,6 +92,9 @@ class JobProcessor:
                         job.content_type,
                         self.settings.relationship_batch_size,
                         cursor=scan.cursor,
+                        expected_count=(
+                            account.follower_count if job.content_type == "followers" else None
+                        ),
                     )
                     run.item_count = self._save_relationship_batch(db, account, scan, batch)
                 else:

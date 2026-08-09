@@ -77,6 +77,38 @@ def test_empty_relationship_diagnostic_keeps_bounded_latest_artifacts(tmp_path) 
     ]
 
 
+def test_positive_follower_count_waits_for_a_visible_relationship_row(tmp_path) -> None:
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, *, state, timeout):
+            assert state == "visible"
+            assert timeout == 30_000
+
+    class FakePage:
+        def __init__(self):
+            self.selector = None
+
+        def locator(self, selector):
+            self.selector = selector
+            return FakeLocator()
+
+    settings = Settings(
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    collector = ThreadsCollector(settings)
+    page = FakePage()
+
+    collector._wait_for_relationship_rows(page, expected_count=51)
+
+    assert page.selector == (
+        '[role="dialog"] a[href*="/@"], [aria-modal="true"] a[href*="/@"]'
+    )
+
+
 def test_content_text_excludes_trailing_threads_ui_numbers() -> None:
     raw = "example\n2026-6-10\n杜拜巧克力＝杜力\n1\n/\n2\n12 萬\n731\n4,014\n2.3 萬"
     assert ThreadsCollector._clean_content_text(raw, "example") == "杜拜巧克力＝杜力"
