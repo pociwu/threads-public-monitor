@@ -55,6 +55,19 @@ def test_dashboard_and_add_account() -> None:
         db.close()
 
 
+def test_static_stylesheets_are_cache_busted_by_app_version() -> None:
+    client, db = make_client()
+    try:
+        response = client.get("/relationships/compare")
+
+        assert response.status_code == 200
+        assert '/static/app.css?v=0.1.23' in response.text
+        assert '/static/relationships.css?v=0.1.23' in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
 def test_reorder_accounts_persists_order() -> None:
     client, db = make_client()
     try:

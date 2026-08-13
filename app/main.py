@@ -47,6 +47,7 @@ app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
 base_dir = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=base_dir / "static"), name="static")
 templates = Jinja2Templates(directory=base_dir / "templates")
+templates.env.globals["app_version"] = __version__
 
 
 def format_number(value: int | None) -> str:
