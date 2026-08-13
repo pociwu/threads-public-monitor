@@ -313,3 +313,56 @@ def test_relationship_compare_both_requires_member_in_both_lists_per_account() -
     finally:
         app.dependency_overrides.clear()
         db.close()
+
+
+def test_relationship_compare_can_include_partial_scans_as_provisional_results() -> None:
+    client, db = make_client()
+    try:
+        complete_account = Account(username="complete", status="active")
+        partial_account = Account(username="partial", status="active")
+        db.add_all([complete_account, partial_account])
+        db.flush()
+        for account, status in (
+            (complete_account, "complete"),
+            (partial_account, "running"),
+        ):
+            scan = RelationshipScan(
+                account_id=account.id,
+                relationship_type="followers",
+                scan_date=date(2026, 8, 14),
+                status=status,
+                collected_count=1,
+            )
+            db.add(scan)
+            db.flush()
+            member = RelationshipMember(
+                account_id=account.id,
+                relationship_type="followers",
+                username="visible_so_far",
+                active=True,
+            )
+            db.add(member)
+            db.flush()
+            db.add(RelationshipScanMember(scan_id=scan.id, member_id=member.id))
+        db.commit()
+
+        response = client.get(
+            "/relationships/compare",
+            params=[
+                ("account_ids", complete_account.id),
+                ("account_ids", partial_account.id),
+                ("comparison_type", "followers"),
+                ("min_present", 2),
+                ("include_partial", "true"),
+            ],
+        )
+
+        assert response.status_code == 200
+        assert "@visible_so_far" in response.text
+        assert "出現在 2 / 2 個帳號" in response.text
+        assert "@partial" in response.text
+        assert "暫定結果" in response.text
+        assert "已擷取 1 人" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()

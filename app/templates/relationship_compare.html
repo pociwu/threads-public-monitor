@@ -32,6 +32,7 @@
     <label>至少出現在幾個帳號
       <input type="number" name="min_present" min="1" max="{{ selected_accounts|length or accounts|length }}" value="{{ min_present }}">
     </label>
+    <label class="partial-option"><input type="checkbox" name="include_partial" value="true" {{ 'checked' if include_partial else '' }}> 使用目前已擷取資料顯示暫定結果</label>
     <button class="button primary" type="submit">開始比較</button>
   </div>
 </form>
@@ -48,8 +49,8 @@
       {% for relationship_type,scan_info in row.types.items() %}{% set scan = scan_info.latest %}{% set complete_scan = scan_info.complete %}
       <p><span>{{ '粉絲' if relationship_type == 'followers' else '追蹤中' }}</span>
         {% if scan and scan.status == 'complete' %}<span class="status status-succeeded">完整 · {{ scan.scan_date }}</span>
-        {% elif complete_scan %}<span class="status status-queued">比較 {{ complete_scan.scan_date }} · 最新{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }}</span>
-        {% elif scan %}<span class="status status-failed">{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }} · {{ scan.scan_date }}</span>
+        {% elif complete_scan %}<span class="status status-queued">比較 {{ complete_scan.scan_date }} · 最新{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }}{% if include_partial and scan.collected_count %} · 已擷取 {{ scan.collected_count }} 人{% endif %}</span>
+        {% elif scan %}<span class="status status-failed">{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }} · {{ scan.scan_date }}{% if include_partial and scan.collected_count %} · 已擷取 {{ scan.collected_count }} 人{% endif %}</span>
         {% else %}<span class="status status-failed">尚無掃描</span>{% endif %}
       </p>
       {% endfor %}
@@ -59,10 +60,11 @@
   {% if eligible_accounts|length < selected_accounts|length %}
   <div class="alert warning">{{ selected_accounts|length - eligible_accounts|length }} 個帳號缺少所需的完整名單，本次已排除；結果可能少於預期，但不會把未擷取資料判定為不存在。</div>
   {% endif %}
+  {% if is_provisional %}<div class="alert warning"><strong>暫定結果：</strong>包含尚未完成的回補名單，只能確認目前已出現的共同使用者；未出現者不能判定為不存在。</div>{% endif %}
 </section>
 
 <section class="relationship-panel comparison-results">
-  <div class="section-heading"><h2>{{ comparison_labels[comparison_type] }}</h2><span class="muted">共 {{ results|length }} 人 · 門檻 {{ min_present }} / {{ eligible_accounts|length }}</span></div>
+  <div class="section-heading"><h2>{{ comparison_labels[comparison_type] }}{% if is_provisional %} · 暫定結果{% endif %}</h2><span class="muted">共 {{ results|length }} 人 · 門檻 {{ min_present }} / {{ eligible_accounts|length }}</span></div>
   <div class="member-grid">
     {% for item in results %}
     <article class="comparison-card">

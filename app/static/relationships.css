@@ -21,9 +21,11 @@
 .account-choice .avatar { width: 38px; height: 38px; }
 .account-choice strong,.account-choice small { display: block; }
 .account-choice small { color: var(--muted); }
-.compare-controls { display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 12px; margin-top: 18px; }
+.compare-controls { display: grid; grid-template-columns: 1fr 1fr minmax(210px,auto) auto; align-items: end; gap: 12px; margin-top: 18px; }
 .compare-controls label { color: var(--muted); font-size: 12px; }
 .compare-controls input,.compare-controls select { margin-top: 6px; }
+.compare-controls .partial-option { display: flex; align-items: center; gap: 8px; min-height: 42px; color: var(--text); }
+.compare-controls .partial-option input { width: 18px; height: 18px; margin: 0; accent-color: var(--violet); }
 .status-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap: 10px; }
 .status-card { background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 13px; }
 .status-card p { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0 0; color: var(--muted); font-size: 12px; }

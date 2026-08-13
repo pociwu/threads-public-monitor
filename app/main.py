@@ -324,6 +324,7 @@ def compare_relationships(
     account_ids: list[int] = Query(default=[]),
     comparison_type: str = Query("followers"),
     min_present: int | None = Query(None, ge=1),
+    include_partial: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     if comparison_type not in {"followers", "following", "both"}:
@@ -350,6 +351,10 @@ def compare_relationships(
     complete_scans: dict[str, dict[int, RelationshipScan]] = {
         relationship_type: {} for relationship_type in needed_types
     }
+    comparison_scans: dict[str, dict[int, RelationshipScan]] = {
+        relationship_type: {} for relationship_type in needed_types
+    }
+    provisional_account_ids: set[int] = set()
     for account in selected_accounts:
         type_statuses = {}
         for relationship_type in needed_types:
@@ -360,14 +365,25 @@ def compare_relationships(
             type_statuses[relationship_type] = {"latest": latest, "complete": complete}
             if complete:
                 complete_scans[relationship_type][account.id] = complete
+            selected_scan = complete
+            if (
+                include_partial
+                and latest
+                and latest.status in {"running", "failed"}
+                and latest.collected_count > 0
+            ):
+                selected_scan = latest
+                provisional_account_ids.add(account.id)
+            if selected_scan:
+                comparison_scans[relationship_type][account.id] = selected_scan
         scan_statuses.append({"account": account, "types": type_statuses})
 
     eligible_ids = set(selected_ids)
     for relationship_type in needed_types:
-        eligible_ids &= set(complete_scans[relationship_type])
+        eligible_ids &= set(comparison_scans[relationship_type])
     eligible_accounts = [account for account in selected_accounts if account.id in eligible_ids]
     threshold = min_present or len(eligible_accounts)
-    threshold = min(max(threshold, 1), max(len(eligible_accounts), 1))
+    threshold = max(threshold, 1)
 
     results = []
     if len(selected_accounts) >= 2 and eligible_accounts:
@@ -376,7 +392,7 @@ def compare_relationships(
                 db,
                 {
                     account_id: scan
-                    for account_id, scan in complete_scans[relationship_type].items()
+                    for account_id, scan in comparison_scans[relationship_type].items()
                     if account_id in eligible_ids
                 },
             )
@@ -420,6 +436,8 @@ def compare_relationships(
             "scan_statuses": scan_statuses,
             "comparison_type": comparison_type,
             "min_present": threshold,
+            "include_partial": include_partial,
+            "is_provisional": bool(provisional_account_ids & eligible_ids),
             "results": results,
             "comparison_labels": {
                 "followers": "共同粉絲",
