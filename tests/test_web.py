@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from app import __version__
 from app.db import Base, get_db
 from app.main import app
 from app.models import (
@@ -61,8 +62,8 @@ def test_static_stylesheets_are_cache_busted_by_app_version() -> None:
         response = client.get("/relationships/compare")
 
         assert response.status_code == 200
-        assert '/static/app.css?v=0.1.23' in response.text
-        assert '/static/relationships.css?v=0.1.23' in response.text
+        assert f'/static/app.css?v={__version__}' in response.text
+        assert f'/static/relationships.css?v={__version__}' in response.text
     finally:
         app.dependency_overrides.clear()
         db.close()
