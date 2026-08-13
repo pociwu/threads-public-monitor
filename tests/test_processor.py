@@ -469,13 +469,13 @@ def test_follower_batch_discovers_following_count_and_queues_following_scan(tmp_
         follower_scan = RelationshipScan(
             account_id=account.id,
             relationship_type="followers",
-            scan_date=date(2026, 8, 9),
+            scan_date=datetime.now(settings.tz).date(),
             status="running",
         )
         following_scan = RelationshipScan(
             account_id=account.id,
             relationship_type="following",
-            scan_date=date(2026, 8, 9),
+            scan_date=datetime.now(settings.tz).date(),
             status="unavailable",
         )
         db.add_all([follower_scan, following_scan])

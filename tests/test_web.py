@@ -7,7 +7,14 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account, CollectionStream, Job, RelationshipMember, RelationshipScan
+from app.models import (
+    Account,
+    CollectionStream,
+    Job,
+    RelationshipMember,
+    RelationshipScan,
+    RelationshipScanMember,
+)
 
 
 def make_client() -> tuple[TestClient, Session]:
@@ -212,6 +219,97 @@ def test_account_detail_marks_following_list_as_not_public() -> None:
         assert response.status_code == 200
         assert "Threads 目前未公開" in response.text
         assert "顯示最後已知名單 1 人" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_relationship_compare_supports_multiple_accounts_and_threshold() -> None:
+    client, db = make_client()
+    try:
+        accounts = [Account(username=name, status="active") for name in ("one", "two", "three")]
+        db.add_all(accounts)
+        db.flush()
+        for account in accounts:
+            scan = RelationshipScan(
+                account_id=account.id,
+                relationship_type="followers",
+                scan_date=date(2026, 8, 14),
+                status="complete",
+            )
+            db.add(scan)
+            db.flush()
+            shared = RelationshipMember(
+                account_id=account.id,
+                relationship_type="followers",
+                username="shared_user",
+                display_name="Shared User",
+                active=True,
+            )
+            db.add(shared)
+            db.flush()
+            db.add(RelationshipScanMember(scan_id=scan.id, member_id=shared.id))
+        db.commit()
+
+        response = client.get(
+            "/relationships/compare",
+            params=[
+                ("account_ids", accounts[0].id),
+                ("account_ids", accounts[1].id),
+                ("account_ids", accounts[2].id),
+                ("comparison_type", "followers"),
+                ("min_present", 2),
+            ],
+        )
+
+        assert response.status_code == 200
+        assert "多帳號名單比較" in response.text
+        assert "@shared_user" in response.text
+        assert "出現在 3 / 3 個帳號" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_relationship_compare_both_requires_member_in_both_lists_per_account() -> None:
+    client, db = make_client()
+    try:
+        accounts = [Account(username=name, status="active") for name in ("one", "two")]
+        db.add_all(accounts)
+        db.flush()
+        for account in accounts:
+            for relationship_type in ("followers", "following"):
+                scan = RelationshipScan(
+                    account_id=account.id,
+                    relationship_type=relationship_type,
+                    scan_date=date(2026, 8, 14),
+                    status="complete",
+                )
+                db.add(scan)
+                db.flush()
+                member = RelationshipMember(
+                    account_id=account.id,
+                    relationship_type=relationship_type,
+                    username="mutual_user",
+                    active=True,
+                )
+                db.add(member)
+                db.flush()
+                db.add(RelationshipScanMember(scan_id=scan.id, member_id=member.id))
+        db.commit()
+
+        response = client.get(
+            "/relationships/compare",
+            params=[
+                ("account_ids", accounts[0].id),
+                ("account_ids", accounts[1].id),
+                ("comparison_type", "both"),
+            ],
+        )
+
+        assert response.status_code == 200
+        assert "@mutual_user" in response.text
+        assert "粉絲與追蹤中" in response.text
     finally:
         app.dependency_overrides.clear()
         db.close()

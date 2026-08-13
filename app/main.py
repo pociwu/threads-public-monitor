@@ -27,6 +27,7 @@ from app.models import (
     RelationshipChange,
     RelationshipMember,
     RelationshipScan,
+    RelationshipScanMember,
     StatSnapshot,
 )
 from app.services.media import media_usage_bytes, media_usage_percent
@@ -267,6 +268,166 @@ def update_interval(
     account.interval_hours = interval_hours
     db.commit()
     return RedirectResponse(f"/accounts/{account_id}", status_code=303)
+
+
+def _latest_relationship_scan(
+    db: Session, account_id: int, relationship_type: str, *, complete_only: bool = False
+) -> RelationshipScan | None:
+    query = select(RelationshipScan).where(
+        RelationshipScan.account_id == account_id,
+        RelationshipScan.relationship_type == relationship_type,
+    )
+    if complete_only:
+        query = query.where(RelationshipScan.status == "complete")
+    return db.scalar(
+        query.order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc()).limit(1)
+    )
+
+
+def _comparison_members(
+    db: Session, scans: dict[int, RelationshipScan]
+) -> dict[str, dict]:
+    if not scans:
+        return {}
+    members = db.scalars(
+        select(RelationshipMember)
+        .join(
+            RelationshipScanMember,
+            RelationshipScanMember.member_id == RelationshipMember.id,
+        )
+        .where(RelationshipScanMember.scan_id.in_([scan.id for scan in scans.values()]))
+        .options(selectinload(RelationshipMember.avatar))
+    ).all()
+    result: dict[str, dict] = {}
+    for member in members:
+        key = member.username.lower()
+        item = result.setdefault(
+            key,
+            {
+                "username": member.username,
+                "display_name": member.display_name,
+                "avatar_url": None,
+                "account_ids": set(),
+            },
+        )
+        item["account_ids"].add(member.account_id)
+        if not item["display_name"] and member.display_name:
+            item["display_name"] = member.display_name
+        if not item["avatar_url"] and member.avatar and member.avatar.local_path:
+            item["avatar_url"] = f"/media/{member.avatar.local_path}"
+    return result
+
+
+@app.get("/relationships/compare", response_class=HTMLResponse)
+def compare_relationships(
+    request: Request,
+    account_ids: list[int] = Query(default=[]),
+    comparison_type: str = Query("followers"),
+    min_present: int | None = Query(None, ge=1),
+    db: Session = Depends(get_db),
+):
+    if comparison_type not in {"followers", "following", "both"}:
+        raise HTTPException(400, "未知的比較類型")
+    selected_ids = list(dict.fromkeys(account_ids))[: settings.max_active_accounts]
+    accounts = db.scalars(
+        select(Account)
+        .where(Account.enabled.is_(True))
+        .options(selectinload(Account.avatar))
+        .order_by(Account.sort_order, Account.id)
+    ).all()
+    accounts_by_id = {account.id: account for account in accounts}
+    selected_accounts = [
+        accounts_by_id[account_id]
+        for account_id in selected_ids
+        if account_id in accounts_by_id
+    ]
+    selected_ids = [account.id for account in selected_accounts]
+
+    needed_types = (
+        ("followers", "following") if comparison_type == "both" else (comparison_type,)
+    )
+    scan_statuses = []
+    complete_scans: dict[str, dict[int, RelationshipScan]] = {
+        relationship_type: {} for relationship_type in needed_types
+    }
+    for account in selected_accounts:
+        type_statuses = {}
+        for relationship_type in needed_types:
+            latest = _latest_relationship_scan(db, account.id, relationship_type)
+            complete = _latest_relationship_scan(
+                db, account.id, relationship_type, complete_only=True
+            )
+            type_statuses[relationship_type] = {"latest": latest, "complete": complete}
+            if complete:
+                complete_scans[relationship_type][account.id] = complete
+        scan_statuses.append({"account": account, "types": type_statuses})
+
+    eligible_ids = set(selected_ids)
+    for relationship_type in needed_types:
+        eligible_ids &= set(complete_scans[relationship_type])
+    eligible_accounts = [account for account in selected_accounts if account.id in eligible_ids]
+    threshold = min_present or len(eligible_accounts)
+    threshold = min(max(threshold, 1), max(len(eligible_accounts), 1))
+
+    results = []
+    if len(selected_accounts) >= 2 and eligible_accounts:
+        member_maps = {
+            relationship_type: _comparison_members(
+                db,
+                {
+                    account_id: scan
+                    for account_id, scan in complete_scans[relationship_type].items()
+                    if account_id in eligible_ids
+                },
+            )
+            for relationship_type in needed_types
+        }
+        usernames = set.intersection(*(set(items) for items in member_maps.values()))
+        for username in usernames:
+            source_items = [member_maps[item_type][username] for item_type in needed_types]
+            present_ids = set.intersection(
+                *(set(item["account_ids"]) for item in source_items)
+            )
+            if len(present_ids) < threshold:
+                continue
+            display_source = next(
+                (item for item in source_items if item["display_name"]), source_items[0]
+            )
+            avatar_source = next(
+                (item for item in source_items if item["avatar_url"]), source_items[0]
+            )
+            results.append(
+                {
+                    "username": display_source["username"],
+                    "display_name": display_source["display_name"],
+                    "avatar_url": avatar_source["avatar_url"],
+                    "accounts": [
+                        account for account in eligible_accounts if account.id in present_ids
+                    ],
+                    "present_count": len(present_ids),
+                }
+            )
+        results.sort(key=lambda item: (-item["present_count"], item["username"].lower()))
+
+    return templates.TemplateResponse(
+        request,
+        "relationship_compare.html",
+        {
+            "accounts": accounts,
+            "selected_ids": selected_ids,
+            "selected_accounts": selected_accounts,
+            "eligible_accounts": eligible_accounts,
+            "scan_statuses": scan_statuses,
+            "comparison_type": comparison_type,
+            "min_present": threshold,
+            "results": results,
+            "comparison_labels": {
+                "followers": "共同粉絲",
+                "following": "共同追蹤中",
+                "both": "粉絲與追蹤中 Both",
+            },
+        },
+    )
 
 
 @app.get("/accounts/{account_id}", response_class=HTMLResponse)

@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}名單比較 · Threads Public Monitor{% endblock %}
+{% block content %}
+<a class="back-link" href="/">← 返回監看首頁</a>
+<section class="compare-hero">
+  <p class="eyebrow">本機資料庫比較</p>
+  <h1>多帳號名單比較</h1>
+  <p class="muted">任選 2～{{ accounts|length }} 個帳號，找出共同粉絲、共同追蹤中，或同時存在於兩種名單的人。</p>
+</section>
+
+<form class="compare-form" method="get" action="/relationships/compare">
+  <div class="section-heading"><h2>選擇監看帳號</h2><span class="muted">已選 {{ selected_accounts|length }} 個</span></div>
+  <div class="account-picker">
+    {% for account in accounts %}
+    <label class="account-choice">
+      <input type="checkbox" name="account_ids" value="{{ account.id }}" {{ 'checked' if account.id in selected_ids else '' }}>
+      {% if account.avatar and account.avatar.local_path %}<img class="avatar" src="/media/{{ account.avatar.local_path }}" alt="">
+      {% else %}<span class="avatar placeholder">@</span>{% endif %}
+      <span><strong>{{ account.display_name or account.username }}</strong><small>@{{ account.username }}</small></span>
+    </label>
+    {% endfor %}
+  </div>
+
+  <div class="compare-controls">
+    <label>比較類型
+      <select name="comparison_type">
+        <option value="followers" {{ 'selected' if comparison_type == 'followers' else '' }}>共同粉絲</option>
+        <option value="following" {{ 'selected' if comparison_type == 'following' else '' }}>共同追蹤中</option>
+        <option value="both" {{ 'selected' if comparison_type == 'both' else '' }}>Both（同時為粉絲與追蹤中）</option>
+      </select>
+    </label>
+    <label>至少出現在幾個帳號
+      <input type="number" name="min_present" min="1" max="{{ selected_accounts|length or accounts|length }}" value="{{ min_present }}">
+    </label>
+    <button class="button primary" type="submit">開始比較</button>
+  </div>
+</form>
+
+{% if selected_accounts|length == 1 %}
+<div class="alert warning">請至少再選擇一個帳號。</div>
+{% elif selected_accounts|length >= 2 %}
+<section class="comparison-status">
+  <div class="section-heading"><h2>資料狀態</h2><span class="muted">僅使用最近一次完整掃描</span></div>
+  <div class="status-grid">
+    {% for row in scan_statuses %}
+    <article class="status-card">
+      <strong>@{{ row.account.username }}</strong>
+      {% for relationship_type,scan_info in row.types.items() %}{% set scan = scan_info.latest %}{% set complete_scan = scan_info.complete %}
+      <p><span>{{ '粉絲' if relationship_type == 'followers' else '追蹤中' }}</span>
+        {% if scan and scan.status == 'complete' %}<span class="status status-succeeded">完整 · {{ scan.scan_date }}</span>
+        {% elif complete_scan %}<span class="status status-queued">比較 {{ complete_scan.scan_date }} · 最新{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }}</span>
+        {% elif scan %}<span class="status status-failed">{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }} · {{ scan.scan_date }}</span>
+        {% else %}<span class="status status-failed">尚無掃描</span>{% endif %}
+      </p>
+      {% endfor %}
+    </article>
+    {% endfor %}
+  </div>
+  {% if eligible_accounts|length < selected_accounts|length %}
+  <div class="alert warning">{{ selected_accounts|length - eligible_accounts|length }} 個帳號缺少所需的完整名單，本次已排除；結果可能少於預期，但不會把未擷取資料判定為不存在。</div>
+  {% endif %}
+</section>
+
+<section class="relationship-panel comparison-results">
+  <div class="section-heading"><h2>{{ comparison_labels[comparison_type] }}</h2><span class="muted">共 {{ results|length }} 人 · 門檻 {{ min_present }} / {{ eligible_accounts|length }}</span></div>
+  <div class="member-grid">
+    {% for item in results %}
+    <article class="comparison-card">
+      <a href="https://www.threads.com/@{{ item.username }}" target="_blank" rel="noreferrer">
+        {% if item.avatar_url %}<img class="avatar" loading="lazy" src="{{ item.avatar_url }}" alt="{{ item.username }} 頭像">
+        {% else %}<span class="avatar placeholder">@</span>{% endif %}
+        <span><strong>{{ item.display_name or item.username }}</strong><small>@{{ item.username }}</small></span>
+      </a>
+      <div class="comparison-count">出現在 {{ item.present_count }} / {{ eligible_accounts|length }} 個帳號</div>
+      <details><summary>查看所屬帳號</summary><div class="account-tags">{% for account in item.accounts %}<span>@{{ account.username }}</span>{% endfor %}</div></details>
+    </article>
+    {% else %}<div class="empty-state small">目前沒有符合門檻的使用者；請降低出現門檻或等待名單完整。</div>{% endfor %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}
