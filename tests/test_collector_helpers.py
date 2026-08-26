@@ -132,6 +132,58 @@ def test_content_text_excludes_trailing_threads_ui_numbers() -> None:
     assert ThreadsCollector._clean_content_text(raw, "example") == "杜拜巧克力＝杜力"
 
 
+@pytest.mark.parametrize(
+    "ui_suffix",
+    [
+        "\n1/2\n讚21\n回覆20\n轉發3\n分享1",
+        "\n1 / 2\n讚 21\n回覆 20\n轉發 3\n分享 1",
+        " 1/2讚21回覆20轉發3分享1",
+    ],
+)
+def test_content_text_excludes_carousel_and_labeled_interaction_suffix(
+    ui_suffix: str,
+) -> None:
+    body = (
+        "從6月初訂購到今日8月快底才來 等了兩個月爆炸久的穿戴甲\n"
+        "連催三次才送到\n"
+        "一次忘記寄出最後一次說補償兩組結果沒有🫥\n"
+        "款式真的很漂亮 但真的太久了...\n"
+        "還是我錯了 穿戴甲都要等這麼久"
+    )
+    raw = f"sin_9311\n{body}{ui_suffix}"
+
+    assert ThreadsCollector._clean_content_text(raw, "sin_9311") == body
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["比例是 1/2", "比例是1/2分享1回覆2", "今天想分享1個故事"],
+)
+def test_content_text_keeps_numbers_that_are_part_of_the_post(body: str) -> None:
+    assert ThreadsCollector._clean_content_text(f"sin_9311\n{body}", "sin_9311") == body
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "今天先說\n分享1\n明天再說",
+        "活動日期\n2026/08/26\n歡迎來玩",
+        "總共有\n100\n份",
+    ],
+)
+def test_content_text_keeps_chrome_like_lines_inside_the_post(body: str) -> None:
+    assert ThreadsCollector._clean_content_text(f"sin_9311\n{body}", "sin_9311") == body
+
+
+def test_content_text_excludes_inline_interactions_without_carousel() -> None:
+    assert (
+        ThreadsCollector._clean_content_text(
+            "sin_9311\n這款真的很好看 讚21回覆20轉發3分享1", "sin_9311"
+        )
+        == "這款真的很好看"
+    )
+
+
 def test_interaction_counts_pair_button_text_with_accessible_labels() -> None:
     controls = [
         {"text": "6,601", "label": "讚 6,601 次"},

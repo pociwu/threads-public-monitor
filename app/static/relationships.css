@@ -1,6 +1,10 @@
 .profile-stats a:hover strong { color: #c4b5fd; }
 .relationship-panel { background: linear-gradient(145deg,#191621,#111016); border: 1px solid var(--line); border-radius: 18px; padding: 20px; }
 .scan-summary { color: var(--muted); font-size: 13px; }
+.scan-error { margin: 12px 0 16px; padding: 12px 14px; border: 1px solid #702638; border-radius: 12px; background: #30151d; color: #fecdd3; }
+.scan-error summary { cursor: pointer; font-size: 13px; font-weight: 700; }
+.scan-error p { max-height: 240px; overflow: auto; margin: 10px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.55; }
+.scan-error time { color: #dba4af; font-size: 11px; }
 .member-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap: 10px; }
 .member-card { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px; }
 .member-card:hover,.change-row:hover { border-color: #4b4559; }

@@ -12,6 +12,7 @@ from playwright.sync_api import BrowserContext, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.config import Settings
+from app.services.content_text import clean_content_text
 
 COUNT_RE = re.compile(r"([\d,.]+)\s*([萬万千KkMm]?)")
 POST_ID_RE = re.compile(r"/post/([^/?#]+)")
@@ -670,22 +671,7 @@ class ThreadsCollector:
 
     @staticmethod
     def _clean_content_text(value: str, author: str) -> str | None:
-        lines = [line.strip() for line in value.splitlines() if line.strip()]
-        ignored = re.compile(
-            r"^(讚|留言|轉發|分享|翻譯|like|reply|repost|share)(\s+[\d,.萬千KkMm]+)?$", re.I
-        )
-        date_or_separator = re.compile(r"^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|/)$")
-        numeric = re.compile(r"^[\d,.]+\s*[萬万千KkMm]?(?:\s*次)?$")
-        candidates = [
-            line
-            for line in lines
-            if line.lower() != author.lower()
-            and not ignored.match(line)
-            and not date_or_separator.match(line)
-        ]
-        has_text = any(not numeric.match(line) for line in candidates)
-        kept = [line for line in candidates if not has_text or not numeric.match(line)]
-        return "\n".join(kept)[:20_000] or None
+        return clean_content_text(value, author)
 
     @staticmethod
     def _button_counts(buttons: list[dict[str, str] | str]) -> dict[str, int | None]:

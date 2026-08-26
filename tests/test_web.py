@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -11,7 +11,12 @@ from app.main import app
 from app.models import (
     Account,
     CollectionStream,
+    Content,
+    ContentMedia,
+    ContentVersion,
+    InteractionSnapshot,
     Job,
+    MediaAsset,
     RelationshipMember,
     RelationshipScan,
     RelationshipScanMember,
@@ -64,6 +69,119 @@ def test_static_stylesheets_are_cache_busted_by_app_version() -> None:
         assert response.status_code == 200
         assert f'/static/app.css?v={__version__}' in response.text
         assert f'/static/relationships.css?v={__version__}' in response.text
+        assert f'/static/content.css?v={__version__}' in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_account_detail_renders_threads_like_content_card_structure() -> None:
+    client, db = make_client()
+    try:
+        avatar = MediaAsset(
+            source_url="https://cdn.example/avatar.jpg",
+            source_key="avatar",
+            media_type="image",
+            local_path="avatars/sin_9311.jpg",
+            download_status="downloaded",
+        )
+        first_media = MediaAsset(
+            source_url="https://cdn.example/one.jpg",
+            source_key="one",
+            media_type="image",
+            local_path="posts/one.jpg",
+            download_status="downloaded",
+        )
+        second_media = MediaAsset(
+            source_url="https://cdn.example/two.jpg",
+            source_key="two",
+            media_type="image",
+            local_path="posts/two.jpg",
+            download_status="downloaded",
+        )
+        db.add_all([avatar, first_media, second_media])
+        db.flush()
+        account = Account(
+            username="sin_9311",
+            display_name="鴨仔",
+            status="active",
+            avatar_media_id=avatar.id,
+        )
+        db.add(account)
+        db.flush()
+        content = Content(
+            threads_id="threads-like-post",
+            account_id=account.id,
+            author_username="sin_9311",
+            content_type="post",
+            source_url="https://www.threads.com/@sin_9311/post/threads-like-post",
+            published_at=datetime(2026, 8, 20, 8, 0),
+        )
+        db.add(content)
+        db.flush()
+        older_content = Content(
+            threads_id="threads-like-post-without-metrics",
+            account_id=account.id,
+            author_username="sin_9311",
+            content_type="post",
+            source_url=(
+                "https://www.threads.com/@sin_9311/post/"
+                "threads-like-post-without-metrics"
+            ),
+            published_at=datetime(2026, 8, 19, 8, 0),
+        )
+        db.add(older_content)
+        db.flush()
+        db.add_all(
+            [
+                ContentVersion(
+                    content_id=content.id,
+                    text="從6月初訂購到今日才收到 1/2讚21回覆20轉發3分享1",
+                    fingerprint="f" * 64,
+                ),
+                ContentMedia(content_id=content.id, media_id=first_media.id, position=0),
+                ContentMedia(content_id=content.id, media_id=second_media.id, position=1),
+                InteractionSnapshot(
+                    content_id=content.id,
+                    like_count=21,
+                    reply_count=20,
+                    repost_count=3,
+                    share_count=1,
+                ),
+                ContentVersion(
+                    content_id=older_content.id,
+                    text="尚無互動快照的獨立貼文",
+                    fingerprint="e" * 64,
+                ),
+            ]
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}?tab=post")
+
+        assert response.status_code == 200
+        assert 'class="content-author-row"' in response.text
+        assert 'class="content-author-avatar"' in response.text
+        assert 'src="/media/avatars/sin_9311.jpg"' in response.text
+        assert 'class="content-source"' in response.text
+        assert 'class="media-carousel"' in response.text
+        assert 'class="media-counter">1/2<' in response.text
+        assert 'class="content-actions"' in response.text
+        assert 'aria-label="讚 21"' in response.text
+        assert 'aria-label="回覆 20"' in response.text
+        assert 'aria-label="轉發 3"' in response.text
+        assert 'aria-label="分享 1"' in response.text
+        assert 'aria-label="讚數未知"' in response.text
+        assert response.text.count('class="content-actions"') == 2
+        assert 'class="content-thread-line"' not in response.text
+        assert "1/2讚21回覆20轉發3分享1" not in response.text
+        assert response.text.index("content-author-row") < response.text.index(
+            "從6月初訂購到今日才收到"
+        )
+        assert response.text.index("從6月初訂購到今日才收到") < response.text.index(
+            "media-carousel"
+        )
+        assert response.text.index("media-carousel") < response.text.index("content-actions")
     finally:
         app.dependency_overrides.clear()
         db.close()
@@ -199,6 +317,66 @@ def test_account_detail_shows_relationship_tabs_members_and_scan_status() -> Non
         assert "每日差異" in response.text
         assert "已擷取 5 人" in response.text
         assert "@alice" in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_account_detail_shows_failure_reason_from_current_relationship_scan() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active", following_count=20)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="following",
+            scan_date=date(2026, 8, 26),
+            status="failed",
+            collected_count=10,
+            started_at=datetime(2026, 8, 26, 1, 0),
+            completed_at=datetime(2026, 8, 26, 2, 0),
+        )
+        db.add(scan)
+        db.add_all(
+            [
+                Job(
+                    account_id=account.id,
+                    kind="relationship",
+                    content_type="following",
+                    status="failed",
+                    error="上一輪錯誤，不應顯示",
+                    created_at=datetime(2026, 8, 25, 23, 0),
+                ),
+                Job(
+                    account_id=account.id,
+                    kind="relationship",
+                    content_type="following",
+                    status="failed",
+                    error="Threads 名單載入逾時，已保留目前 10 人",
+                    created_at=datetime(2026, 8, 26, 1, 15),
+                    finished_at=datetime(2026, 8, 26, 2, 0),
+                ),
+                Job(
+                    account_id=account.id,
+                    kind="relationship",
+                    content_type="following",
+                    status="failed",
+                    error="本輪結束後的錯誤，不應顯示",
+                    created_at=datetime(2026, 8, 26, 2, 30),
+                    finished_at=datetime(2026, 8, 26, 2, 40),
+                ),
+            ]
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}?tab=following")
+
+        assert response.status_code == 200
+        assert "查看本輪失敗原因" in response.text
+        assert "Threads 名單載入逾時，已保留目前 10 人" in response.text
+        assert "上一輪錯誤，不應顯示" not in response.text
+        assert "本輪結束後的錯誤，不應顯示" not in response.text
     finally:
         app.dependency_overrides.clear()
         db.close()

@@ -30,6 +30,7 @@ from app.models import (
     RelationshipScanMember,
     StatSnapshot,
 )
+from app.services.content_text import clean_content_text
 from app.services.media import media_usage_bytes, media_usage_percent
 from app.services.queue import enqueue_unique, now_utc
 from app.services.usernames import InvalidUsername, normalize_username
@@ -61,8 +62,27 @@ def format_time(value: datetime | None) -> str:
     return aware.astimezone(settings.tz).strftime("%Y/%m/%d %H:%M")
 
 
+def format_relative_time(value: datetime | None) -> str:
+    if value is None:
+        return "未知時間"
+    aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    seconds = max(0, int((datetime.now(UTC) - aware.astimezone(UTC)).total_seconds()))
+    if seconds < 60:
+        return "剛剛"
+    if seconds < 3600:
+        return f"{seconds // 60}分鐘"
+    if seconds < 86_400:
+        return f"{seconds // 3600}小時"
+    if seconds < 30 * 86_400:
+        return f"{seconds // 86_400}天"
+    if seconds < 365 * 86_400:
+        return f"{seconds // (30 * 86_400)}個月"
+    return f"{seconds // (365 * 86_400)}年"
+
+
 templates.env.filters["number"] = format_number
 templates.env.filters["localtime"] = format_time
+templates.env.filters["relative_time"] = format_relative_time
 
 
 def _account_cards(db: Session) -> list[dict]:
@@ -493,13 +513,24 @@ def account_detail(
         contents = contents[:page_size]
     content_views = []
     for content in contents:
+        version = content.versions[-1] if content.versions else None
         metrics = db.scalar(
             select(InteractionSnapshot)
             .where(InteractionSnapshot.content_id == content.id)
             .order_by(InteractionSnapshot.id.desc())
             .limit(1)
         )
-        content_views.append({"content": content, "metrics": metrics})
+        content_views.append(
+            {
+                "content": content,
+                "metrics": metrics,
+                "display_text": clean_content_text(
+                    version.text or "", content.author_username
+                )
+                if version
+                else None,
+            }
+        )
 
     snapshots = db.scalars(
         select(StatSnapshot)
@@ -525,6 +556,7 @@ def account_detail(
         ).all()
     relationship_members = []
     relationship_scan = None
+    relationship_failure_job = None
     if tab in {"followers", "following"}:
         relationship_members = db.scalars(
             select(RelationshipMember)
@@ -549,6 +581,26 @@ def account_detail(
             .order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc())
             .limit(1)
         )
+        if (
+            relationship_scan
+            and relationship_scan.status == "failed"
+            and relationship_scan.completed_at
+        ):
+            relationship_failure_job = db.scalar(
+                select(Job)
+                .where(
+                    Job.account_id == account.id,
+                    Job.kind == "relationship",
+                    Job.content_type == tab,
+                    Job.status == "failed",
+                    Job.created_at >= relationship_scan.started_at,
+                    Job.finished_at.is_not(None),
+                    Job.finished_at <= relationship_scan.completed_at,
+                    Job.error.is_not(None),
+                )
+                .order_by(Job.finished_at.desc(), Job.id.desc())
+                .limit(1)
+            )
     relationship_changes = []
     if tab == "changes":
         relationship_changes = db.scalars(
@@ -575,6 +627,7 @@ def account_detail(
             "runs": runs,
             "relationship_members": relationship_members,
             "relationship_scan": relationship_scan,
+            "relationship_failure_job": relationship_failure_job,
             "relationship_changes": relationship_changes,
             "relationship_batch_size": settings.relationship_batch_size,
             "chart_data": chart_data,

@@ -54,6 +54,9 @@
   <div class="section-heading"><h2>{{ '粉絲名單' if tab == 'followers' else '追蹤中名單' }}</h2><span class="muted">每批 {{ relationship_batch_size }} 人</span></div>
   {% if relationship_scan %}
   <p class="scan-summary"><span class="status status-{{ 'succeeded' if relationship_scan.status == 'complete' else ('queued' if relationship_scan.status == 'running' else ('muted' if relationship_scan.status == 'unavailable' else 'failed')) }}">{{ {'complete':'本輪完成','running':'分批擷取中','failed':'本輪失敗','unavailable':'Threads 目前未公開'}.get(relationship_scan.status, relationship_scan.status) }}</span>{% if relationship_scan.status == 'unavailable' %} 本輪未取得；顯示最後已知名單 {{ relationship_members|length }} 人{% else %} 已擷取 {{ relationship_scan.collected_count }} 人{% endif %} · 掃描日期 {{ relationship_scan.scan_date }}{% if relationship_scan.status not in ['complete', 'unavailable'] %} · 未完成前不計算退出名單{% endif %}</p>
+  {% if relationship_failure_job and relationship_failure_job.error %}
+  <details class="scan-error" open><summary>查看本輪失敗原因</summary><p>{{ relationship_failure_job.error }}</p>{% if relationship_failure_job.finished_at %}<time>發生於 {{ relationship_failure_job.finished_at|localtime }}</time>{% endif %}</details>
+  {% endif %}
   {% else %}<p class="muted">尚未開始擷取；下次帳號拜訪後會建立第一輪名單。</p>{% endif %}
   <div class="member-grid">
     {% for member in relationship_members %}
@@ -83,12 +86,29 @@
 </section>
 {% else %}
 <section class="feed">
-  {% for item in content_views %}{% set content = item.content %}{% set version = content.versions[-1] if content.versions else none %}
+  {% for item in content_views %}{% set content = item.content %}{% set media_links = content.media_links|sort(attribute='position') %}{% set metrics = item.metrics %}{% set like_count = metrics.like_count if metrics else none %}{% set reply_count = metrics.reply_count if metrics else none %}{% set repost_count = metrics.repost_count if metrics else none %}{% set share_count = metrics.share_count if metrics else none %}
   <article class="content-card">
-    <header><span class="content-type">{{ {'post':'串文','reply':'回覆','repost':'轉發','quote':'引用轉發'}.get(content.content_type, content.content_type) }}</span><a href="{{ content.source_url }}" target="_blank" rel="noreferrer">@{{ content.author_username }}</a><time>{{ content.published_at|localtime }}</time>{% if content.suspected_removed %}<span class="status status-error">疑似已移除</span>{% endif %}</header>
-    {% if version and version.text %}<p class="content-text">{{ version.text }}</p>{% endif %}
-    {% if content.media_links %}<div class="media-grid">{% for link in content.media_links|sort(attribute='position') %}{% if link.media.local_path %}{% if link.media.media_type == 'video' %}<video controls preload="metadata" src="/media/{{ link.media.local_path }}"></video>{% else %}<img loading="lazy" src="/media/{{ link.media.local_path }}" alt="串文媒體">{% endif %}{% else %}<div class="media-missing">{{ link.media.failure_reason or '媒體尚未保存' }}</div>{% endif %}{% endfor %}</div>{% endif %}
-    {% if item.metrics %}<footer class="engagement"><span>♡ {{ item.metrics.like_count|number }}</span><span>回覆 {{ item.metrics.reply_count|number }}</span><span>轉發 {{ item.metrics.repost_count|number }}</span><span>分享 {{ item.metrics.share_count|number }}</span></footer>{% endif %}
+    <div class="content-avatar-column">
+      <a class="content-author-avatar" href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="開啟 @{{ content.author_username }} 的原文">
+        {% if (content.author_username|lower) == (account.username|lower) and avatar_url %}<img class="avatar" loading="lazy" src="{{ avatar_url }}" alt="{{ content.author_username }} 頭像">
+        {% else %}<span class="avatar placeholder">@</span>{% endif %}
+      </a>
+    </div>
+    <div class="content-post">
+      <header class="content-author-row">
+        <div class="content-author-meta"><a class="content-author" href="{{ content.source_url }}" target="_blank" rel="noreferrer">{{ content.author_username }}</a>{% if content.content_type != 'post' %}<span class="content-context">{{ {'reply':'回覆','repost':'轉發','quote':'引用轉發'}.get(content.content_type, content.content_type) }}</span>{% endif %}<time class="content-time" title="{{ content.published_at|localtime }}">{{ content.published_at|relative_time }}</time></div>
+        {% if content.suspected_removed %}<span class="status status-error">疑似已移除</span>{% endif %}
+        <a class="content-source" href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="在 Threads 開啟原文">•••</a>
+      </header>
+      {% if item.display_text %}<p class="content-text">{{ item.display_text }}</p>{% endif %}
+      {% if media_links %}<div class="media-carousel">{% for link in media_links %}<figure class="media-slide">{% if link.media.local_path %}{% if link.media.media_type == 'video' %}<video controls preload="metadata" src="/media/{{ link.media.local_path }}"></video>{% else %}<img loading="lazy" src="/media/{{ link.media.local_path }}" alt="串文媒體 {{ loop.index }}/{{ loop.length }}">{% endif %}{% else %}<div class="media-missing">{{ link.media.failure_reason or '媒體尚未保存' }}</div>{% endif %}{% if loop.length > 1 %}<span class="media-counter">{{ loop.index }}/{{ loop.length }}</span>{% endif %}</figure>{% endfor %}</div>{% endif %}
+      <footer class="content-actions">
+        <a href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="讚{% if like_count is not none %} {{ like_count|number }}{% else %}數未知{% endif %}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.8-7.5 1.1-1.1a5.5 5.5 0 0 0-.1-7.8Z"/></svg>{% if like_count is not none %}<span>{{ like_count|number }}</span>{% endif %}</a>
+        <a href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="回覆{% if reply_count is not none %} {{ reply_count|number }}{% else %}數未知{% endif %}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.5 9.7 9.7 0 0 1-4-.9L3 21l1.8-4.4A8.4 8.4 0 1 1 21 11.5Z"/></svg>{% if reply_count is not none %}<span>{{ reply_count|number }}</span>{% endif %}</a>
+        <a href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="轉發{% if repost_count is not none %} {{ repost_count|number }}{% else %}數未知{% endif %}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m17 2 4 4-4 4M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4m14-1v2a3 3 0 0 1-3 3H3"/></svg>{% if repost_count is not none %}<span>{{ repost_count|number }}</span>{% endif %}</a>
+        <a href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="分享{% if share_count is not none %} {{ share_count|number }}{% else %}數未知{% endif %}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4 20-7ZM11 13 22 2"/></svg>{% if share_count is not none %}<span>{{ share_count|number }}</span>{% endif %}</a>
+      </footer>
+    </div>
   </article>
   {% else %}<div class="empty-state small">此分類尚無內容</div>{% endfor %}
 </section>
