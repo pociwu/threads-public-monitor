@@ -556,7 +556,7 @@ def account_detail(
         ).all()
     relationship_members = []
     relationship_scan = None
-    relationship_failure_job = None
+    relationship_issue_job = None
     if tab in {"followers", "following"}:
         relationship_members = db.scalars(
             select(RelationshipMember)
@@ -581,12 +581,26 @@ def account_detail(
             .order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc())
             .limit(1)
         )
-        if (
+        if relationship_scan and relationship_scan.status == "running":
+            relationship_issue_job = db.scalar(
+                select(Job)
+                .where(
+                    Job.account_id == account.id,
+                    Job.kind == "relationship",
+                    Job.content_type == tab,
+                    Job.status == "queued",
+                    Job.created_at >= relationship_scan.started_at,
+                    Job.error.is_not(None),
+                )
+                .order_by(Job.not_before.desc(), Job.id.desc())
+                .limit(1)
+            )
+        elif (
             relationship_scan
             and relationship_scan.status == "failed"
             and relationship_scan.completed_at
         ):
-            relationship_failure_job = db.scalar(
+            relationship_issue_job = db.scalar(
                 select(Job)
                 .where(
                     Job.account_id == account.id,
@@ -627,7 +641,7 @@ def account_detail(
             "runs": runs,
             "relationship_members": relationship_members,
             "relationship_scan": relationship_scan,
-            "relationship_failure_job": relationship_failure_job,
+            "relationship_issue_job": relationship_issue_job,
             "relationship_changes": relationship_changes,
             "relationship_batch_size": settings.relationship_batch_size,
             "chart_data": chart_data,

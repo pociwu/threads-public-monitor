@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +10,7 @@ from app.config import Settings
 from app.db import Base
 from app.models import (
     Account,
+    CollectionRun,
     CollectionStream,
     Content,
     ContentMedia,
@@ -21,14 +22,17 @@ from app.models import (
     RelationshipChange,
     RelationshipMember,
     RelationshipScan,
+    RelationshipScanMember,
     StatSnapshot,
 )
 from app.services.collector import (
     CollectionError,
     ContentData,
+    LoginRequired,
     ProfileData,
     RelationshipBatch,
     RelationshipMemberData,
+    TransientRelationshipError,
 )
 from app.services.processor import JobProcessor
 
@@ -444,12 +448,68 @@ def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> 
         db.add(scan)
         db.flush()
 
-        with pytest.raises(CollectionError, match="粉絲清單尚未載入"):
+        with pytest.raises(TransientRelationshipError, match="粉絲清單尚未載入"):
             processor._save_relationship_batch(
                 db, account, scan, relationship_batch(complete=True)
             )
 
         assert scan.status == "running"
+        assert scan.collected_count == 0
+
+
+def test_unknown_relationship_total_cannot_complete_as_empty(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=None)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 8),
+            status="running",
+        )
+        db.add(scan)
+        db.flush()
+
+        with pytest.raises(TransientRelationshipError, match="粉絲清單尚未載入"):
+            processor._save_relationship_batch(
+                db, account, scan, relationship_batch(complete=True)
+            )
+
+        assert scan.status == "running"
+
+
+def test_known_zero_relationship_total_can_complete_as_empty(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=0)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 8),
+            status="running",
+        )
+        db.add(scan)
+        db.flush()
+
+        processor._save_relationship_batch(
+            db, account, scan, relationship_batch(complete=True)
+        )
+
+        assert scan.status == "complete"
         assert scan.collected_count == 0
 
 
@@ -535,6 +595,277 @@ def test_relationship_scan_cannot_complete_before_known_total(tmp_path) -> None:
         assert scan.status == "running"
 
 
+def test_empty_incomplete_relationship_batch_is_transient_no_progress(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 9),
+            status="running",
+            cursor="saved_cursor",
+            collected_count=5,
+        )
+        db.add(scan)
+        db.flush()
+
+        with pytest.raises(TransientRelationshipError, match="未取得新成員"):
+            processor._save_relationship_batch(
+                db,
+                account,
+                scan,
+                RelationshipBatch(
+                    members=[],
+                    cursor="saved_cursor",
+                    complete=False,
+                ),
+            )
+
+        assert scan.status == "running"
+        assert scan.cursor == "saved_cursor"
+
+
+def test_schedule_keeps_cross_day_running_relationship_scan(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    today = datetime.now(settings.tz).date()
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        old_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=today - timedelta(days=1),
+            status="running",
+            cursor="saved_cursor",
+            collected_count=5,
+        )
+        retry_job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="queued",
+            attempts=1,
+        )
+        db.add_all([old_scan, retry_job])
+        db.flush()
+
+        processor._schedule_relationship_scans(db, account)
+        db.flush()
+
+        scans = db.scalars(
+            select(RelationshipScan).where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == "followers",
+            )
+        ).all()
+        jobs = db.scalars(
+            select(Job).where(
+                Job.account_id == account.id,
+                Job.kind == "relationship",
+                Job.content_type == "followers",
+                Job.status.in_(["queued", "running"]),
+            )
+        ).all()
+        assert scans == [old_scan]
+        assert jobs == [retry_job]
+
+
+def test_schedule_does_not_reopen_final_failed_scan_on_same_day(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    today = datetime.now(settings.tz).date()
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        failed_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=today,
+            status="failed",
+            collected_count=5,
+            completed_at=datetime(2026, 8, 26, 4, 0),
+        )
+        db.add(failed_scan)
+        db.flush()
+
+        processor._schedule_relationship_scans(db, account)
+        db.flush()
+
+        assert failed_scan.status == "failed"
+        assert failed_scan.completed_at is not None
+        queued = db.scalar(
+            select(func.count(Job.id)).where(
+                Job.account_id == account.id,
+                Job.kind == "relationship",
+                Job.content_type == "followers",
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        assert queued == 0
+
+
+def test_schedule_starts_new_scan_after_prior_day_final_failure(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    today = datetime.now(settings.tz).date()
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        failed_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=today - timedelta(days=1),
+            status="failed",
+            collected_count=5,
+        )
+        db.add(failed_scan)
+        db.flush()
+
+        processor._schedule_relationship_scans(db, account)
+        db.flush()
+
+        scans = db.scalars(
+            select(RelationshipScan)
+            .where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == "followers",
+            )
+            .order_by(RelationshipScan.scan_date)
+        ).all()
+        assert [scan.status for scan in scans] == ["failed", "running"]
+        assert [scan.scan_date for scan in scans] == [today - timedelta(days=1), today]
+
+
+def test_following_zero_does_not_reopen_same_day_final_failure(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    today = datetime.now(settings.tz).date()
+    with make_session() as db:
+        account = Account(username="example", status="active", following_count=149)
+        db.add(account)
+        db.flush()
+        failed_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="following",
+            scan_date=today,
+            status="failed",
+            collected_count=5,
+            completed_at=datetime(2026, 8, 26, 4, 0),
+        )
+        db.add(failed_scan)
+        db.flush()
+
+        processor._activate_following_scan(db, account, 0)
+        account.following_count = 149
+        processor._schedule_relationship_scans(db, account)
+        db.flush()
+
+        assert failed_scan.status == "failed"
+        assert failed_scan.completed_at is not None
+        queued = db.scalar(
+            select(func.count(Job.id)).where(
+                Job.account_id == account.id,
+                Job.kind == "relationship",
+                Job.content_type == "following",
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        assert queued == 0
+
+
+def test_following_zero_completes_new_scan_and_records_removed_members(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    today = datetime.now(settings.tz).date()
+    with make_session() as db:
+        account = Account(username="example", status="active", following_count=0)
+        db.add(account)
+        db.flush()
+        member = RelationshipMember(
+            account_id=account.id,
+            relationship_type="following",
+            username="previous_member",
+            active=True,
+        )
+        previous_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="following",
+            scan_date=today - timedelta(days=1),
+            status="complete",
+            collected_count=1,
+            completed_at=datetime(2026, 8, 25, 4, 0),
+        )
+        db.add_all([member, previous_scan])
+        db.flush()
+        db.add(RelationshipScanMember(scan_id=previous_scan.id, member_id=member.id))
+        db.flush()
+
+        processor._activate_following_scan(db, account, 0)
+        db.flush()
+
+        current_scan = db.scalar(
+            select(RelationshipScan).where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == "following",
+                RelationshipScan.scan_date == today,
+            )
+        )
+        change = db.scalar(
+            select(RelationshipChange).where(
+                RelationshipChange.scan_id == current_scan.id,
+                RelationshipChange.member_id == member.id,
+                RelationshipChange.change_type == "removed",
+            )
+        )
+        assert current_scan.status == "complete"
+        assert current_scan.collected_count == 0
+        assert member.active is False
+        assert member.removed_at is not None
+        assert change is not None
+
+
 def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:
     class FailingRelationshipCollector(FakeCollector):
         def collect_relationships(self, *_args, **_kwargs):
@@ -572,3 +903,148 @@ def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:
         assert scan.status == "failed"
         assert account.status == "active"
         assert account.status_message is None
+
+
+def test_transient_relationship_failure_requeues_same_job_after_long_backoff(
+    tmp_path,
+) -> None:
+    class SlowRelationshipCollector(FakeCollector):
+        def collect_relationships(self, *_args, **_kwargs):
+            raise TransientRelationshipError("Threads 粉絲清單載入逾時，未取得任何成員")
+
+    retry_at = datetime(2026, 8, 26, 3, 30)
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 26),
+            status="running",
+            cursor="saved_cursor",
+        )
+        job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="running",
+            attempts=1,
+            started_at=datetime(2026, 8, 26, 2, 0),
+        )
+        db.add_all([scan, job])
+        db.commit()
+
+        with (
+            patch("app.services.processor.ThreadsCollector", SlowRelationshipCollector),
+            patch(
+                "app.services.processor.next_relationship_retry",
+                return_value=retry_at,
+                create=True,
+            ),
+        ):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert job.status == "queued"
+        assert job.attempts == 1
+        assert job.not_before == retry_at
+        assert job.started_at is None
+        assert job.finished_at is None
+        assert "載入逾時" in (job.error or "")
+        assert scan.status == "running"
+        assert scan.cursor == "saved_cursor"
+        assert scan.completed_at is None
+        assert account.status == "active"
+        assert db.scalar(select(func.count(Job.id))) == 1
+        run = db.scalar(select(CollectionRun))
+        assert run is not None
+        assert run.status == "failed"
+        assert "載入逾時" in (run.message or "")
+
+
+def test_transient_relationship_failure_stops_after_attempt_limit(tmp_path) -> None:
+    class SlowRelationshipCollector(FakeCollector):
+        def collect_relationships(self, *_args, **_kwargs):
+            raise TransientRelationshipError("Threads 粉絲清單載入逾時，未取得任何成員")
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 26),
+            status="running",
+        )
+        job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="running",
+            attempts=3,
+        )
+        db.add_all([scan, job])
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", SlowRelationshipCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert job.status == "failed"
+        assert job.finished_at is not None
+        assert scan.status == "failed"
+        assert scan.completed_at is not None
+        assert account.status == "active"
+        assert db.scalar(select(func.count(Job.id)).where(Job.status == "queued")) == 0
+
+
+def test_relationship_login_failure_is_never_automatically_requeued(tmp_path) -> None:
+    class LoggedOutCollector(FakeCollector):
+        def collect_relationships(self, *_args, **_kwargs):
+            raise LoginRequired("Threads 登入工作階段已失效")
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 26),
+            status="running",
+        )
+        job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="running",
+            attempts=1,
+        )
+        db.add_all([scan, job])
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", LoggedOutCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert job.status == "failed"
+        assert scan.status == "failed"
+        assert account.status == "login_required"
+        assert "登入工作階段已失效" in (account.status_message or "")

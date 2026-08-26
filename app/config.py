@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,9 +34,23 @@ class Settings(BaseSettings):
     batch_size: int = 10
     backfill_limit: int = 100
     relationship_batch_size: int = 5
+    relationship_max_attempts: int = Field(default=3, ge=1)
+    relationship_retry_min_delay_seconds: int = Field(default=2700, ge=0)
+    relationship_retry_max_delay_seconds: int = Field(default=5400, ge=0)
     log_level: str = "INFO"
 
     chromium_executable: str = Field(default="/usr/bin/chromium")
+
+    @model_validator(mode="after")
+    def validate_relationship_retry_delay(self) -> Settings:
+        if (
+            self.relationship_retry_min_delay_seconds
+            > self.relationship_retry_max_delay_seconds
+        ):
+            raise ValueError(
+                "relationship retry minimum delay must not exceed maximum delay"
+            )
+        return self
 
     @property
     def tz(self) -> ZoneInfo:

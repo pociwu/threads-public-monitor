@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.config import Settings
 from app.services.collector import (
@@ -77,14 +78,14 @@ def test_empty_relationship_diagnostic_keeps_bounded_latest_artifacts(tmp_path) 
     ]
 
 
-def test_positive_follower_count_waits_for_a_visible_relationship_row(tmp_path) -> None:
+def test_positive_follower_count_waits_for_an_active_relationship_row(tmp_path) -> None:
     class FakeLocator:
         @property
         def first(self):
             return self
 
         def wait_for(self, *, state, timeout):
-            assert state == "visible"
+            assert state == "attached"
             assert timeout == 30_000
 
     class FakePage:
@@ -105,8 +106,161 @@ def test_positive_follower_count_waits_for_a_visible_relationship_row(tmp_path) 
     collector._wait_for_relationship_rows(page, expected_count=51)
 
     assert page.selector == (
-        '[role="dialog"] a[href*="/@"], [aria-modal="true"] a[href*="/@"]'
+        '[role="dialog"]:visible a[href*="/@"], '
+        '[aria-modal="true"]:visible a[href*="/@"]'
     )
+
+
+def test_unknown_relationship_count_also_waits_for_an_active_row(tmp_path) -> None:
+    class FakeLocator:
+        called = False
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, *, state, timeout):
+            assert state == "attached"
+            assert timeout == 30_000
+            self.called = True
+
+    class FakePage:
+        def __init__(self):
+            self.rows = FakeLocator()
+
+        def locator(self, _selector):
+            return self.rows
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    page = FakePage()
+
+    collector._wait_for_relationship_rows(page, expected_count=None)
+
+    assert page.rows.called is True
+
+
+def test_relationship_helpers_target_active_dialog_and_correct_list_name() -> None:
+    class FakeLocator:
+        def __init__(self):
+            self.has_text = None
+
+        def filter(self, *, has_text):
+            self.has_text = has_text
+            return self
+
+        @property
+        def first(self):
+            return "active-dialog"
+
+    class FakePage:
+        def __init__(self):
+            self.selector = None
+
+        def locator(self, selector):
+            self.selector = selector
+            return FakeLocator()
+
+    page = FakePage()
+
+    assert ThreadsCollector._active_relationship_dialog(page) == "active-dialog"
+    assert page.selector == '[role="dialog"]:visible, [aria-modal="true"]:visible'
+    assert ThreadsCollector._relationship_timeout_message("followers") == (
+        "Threads 粉絲清單載入逾時，未取得任何成員"
+    )
+    assert ThreadsCollector._relationship_timeout_message("following") == (
+        "Threads 追蹤中清單載入逾時，未取得任何成員"
+    )
+    assert ThreadsCollector._effective_relationship_count(
+        "followers", {"followers": "粉絲 0", "following": "追蹤中 149"}, 51
+    ) == 0
+    assert ThreadsCollector._effective_relationship_count(
+        "following", {"followers": "粉絲 51", "following": None}, 149
+    ) == 149
+
+
+def test_relationship_row_wait_survives_one_transient_timeout(tmp_path) -> None:
+    class FakeLocator:
+        def __init__(self):
+            self.attempts = 0
+            self.timeouts = []
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, *, state, timeout):
+            assert state == "attached"
+            self.attempts += 1
+            self.timeouts.append(timeout)
+            if self.attempts == 1:
+                raise PlaywrightTimeoutError("Threads rendered the list slowly")
+
+    class FakePage:
+        def __init__(self):
+            self.rows = FakeLocator()
+            self.waits = []
+
+        def locator(self, _selector):
+            return self.rows
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    settings = Settings(
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    collector = ThreadsCollector(settings)
+    page = FakePage()
+
+    collector._wait_for_relationship_rows(page, expected_count=51)
+
+    assert page.rows.timeouts == [30_000, 20_000]
+    assert page.waits == [2_500]
+
+
+def test_relationship_row_wait_stops_after_two_passive_timeouts(tmp_path) -> None:
+    class FakeLocator:
+        def __init__(self):
+            self.timeouts = []
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, *, state, timeout):
+            assert state == "attached"
+            self.timeouts.append(timeout)
+            raise PlaywrightTimeoutError("Threads did not render the list")
+
+    class FakePage:
+        def __init__(self):
+            self.rows = FakeLocator()
+            self.waits = []
+
+        def locator(self, _selector):
+            return self.rows
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    settings = Settings(
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    collector = ThreadsCollector(settings)
+    page = FakePage()
+
+    with pytest.raises(PlaywrightTimeoutError):
+        collector._wait_for_relationship_rows(page, expected_count=51)
+
+    assert page.rows.timeouts == [30_000, 20_000]
+    assert page.waits == [2_500]
 
 
 def test_relationship_control_retries_until_threads_renders_it() -> None:

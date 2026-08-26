@@ -5,6 +5,8 @@
 .scan-error summary { cursor: pointer; font-size: 13px; font-weight: 700; }
 .scan-error p { max-height: 240px; overflow: auto; margin: 10px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.55; }
 .scan-error time { color: #dba4af; font-size: 11px; }
+.scan-error.retrying { border-color: #856404; background: #30250d; color: #fde68a; }
+.scan-error.retrying time { color: #e8cf84; }
 .member-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap: 10px; }
 .member-card { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px; }
 .member-card:hover,.change-row:hover { border-color: #4b4559; }

@@ -382,6 +382,99 @@ def test_account_detail_shows_failure_reason_from_current_relationship_scan() ->
         db.close()
 
 
+def test_account_detail_shows_transient_relationship_retry_without_stale_error() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        db.add(
+            RelationshipScan(
+                account_id=account.id,
+                relationship_type="followers",
+                scan_date=date(2026, 8, 26),
+                status="running",
+                collected_count=5,
+                started_at=datetime(2026, 8, 26, 1, 0),
+            )
+        )
+        db.add_all(
+            [
+                Job(
+                    account_id=account.id,
+                    kind="relationship",
+                    content_type="followers",
+                    status="failed",
+                    error="舊掃描錯誤，不應顯示",
+                    created_at=datetime(2026, 8, 25, 23, 0),
+                    finished_at=datetime(2026, 8, 25, 23, 30),
+                ),
+                Job(
+                    account_id=account.id,
+                    kind="relationship",
+                    content_type="followers",
+                    status="queued",
+                    error="Threads 粉絲清單載入逾時，未取得任何成員",
+                    created_at=datetime(2026, 8, 26, 1, 15),
+                    not_before=datetime(2026, 8, 26, 2, 0),
+                ),
+            ]
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}?tab=followers")
+
+        assert response.status_code == 200
+        assert "等待重試" in response.text
+        assert "查看本輪暫時失敗原因" in response.text
+        assert "Threads 粉絲清單載入逾時，未取得任何成員" in response.text
+        assert "已保留目前進度；下次最早重試" in response.text
+        assert "舊掃描錯誤，不應顯示" not in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_account_detail_keeps_clean_queued_relationship_job_as_collecting() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        db.add(
+            RelationshipScan(
+                account_id=account.id,
+                relationship_type="followers",
+                scan_date=date(2026, 8, 26),
+                status="running",
+                collected_count=5,
+                started_at=datetime(2026, 8, 26, 1, 0),
+            )
+        )
+        db.add(
+            Job(
+                account_id=account.id,
+                kind="relationship",
+                content_type="followers",
+                status="queued",
+                error=None,
+                created_at=datetime(2026, 8, 26, 1, 15),
+                not_before=datetime(2026, 8, 26, 2, 0),
+            )
+        )
+        db.commit()
+
+        response = client.get(f"/accounts/{account.id}?tab=followers")
+
+        assert response.status_code == 200
+        assert "分批擷取中" in response.text
+        assert "等待重試" not in response.text
+        assert "查看本輪暫時失敗原因" not in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
 def test_account_detail_marks_following_list_as_not_public() -> None:
     client, db = make_client()
     try:

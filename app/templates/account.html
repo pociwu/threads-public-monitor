@@ -53,9 +53,10 @@
 <section class="relationship-panel">
   <div class="section-heading"><h2>{{ '粉絲名單' if tab == 'followers' else '追蹤中名單' }}</h2><span class="muted">每批 {{ relationship_batch_size }} 人</span></div>
   {% if relationship_scan %}
-  <p class="scan-summary"><span class="status status-{{ 'succeeded' if relationship_scan.status == 'complete' else ('queued' if relationship_scan.status == 'running' else ('muted' if relationship_scan.status == 'unavailable' else 'failed')) }}">{{ {'complete':'本輪完成','running':'分批擷取中','failed':'本輪失敗','unavailable':'Threads 目前未公開'}.get(relationship_scan.status, relationship_scan.status) }}</span>{% if relationship_scan.status == 'unavailable' %} 本輪未取得；顯示最後已知名單 {{ relationship_members|length }} 人{% else %} 已擷取 {{ relationship_scan.collected_count }} 人{% endif %} · 掃描日期 {{ relationship_scan.scan_date }}{% if relationship_scan.status not in ['complete', 'unavailable'] %} · 未完成前不計算退出名單{% endif %}</p>
-  {% if relationship_failure_job and relationship_failure_job.error %}
-  <details class="scan-error" open><summary>查看本輪失敗原因</summary><p>{{ relationship_failure_job.error }}</p>{% if relationship_failure_job.finished_at %}<time>發生於 {{ relationship_failure_job.finished_at|localtime }}</time>{% endif %}</details>
+  {% set waiting_retry = relationship_issue_job and relationship_issue_job.status == 'queued' %}
+  <p class="scan-summary"><span class="status status-{{ 'succeeded' if relationship_scan.status == 'complete' else ('queued' if relationship_scan.status == 'running' else ('muted' if relationship_scan.status == 'unavailable' else 'failed')) }}">{{ '等待重試' if waiting_retry else {'complete':'本輪完成','running':'分批擷取中','failed':'本輪失敗','unavailable':'Threads 目前未公開'}.get(relationship_scan.status, relationship_scan.status) }}</span>{% if relationship_scan.status == 'unavailable' %} 本輪未取得；顯示最後已知名單 {{ relationship_members|length }} 人{% else %} 已擷取 {{ relationship_scan.collected_count }} 人{% endif %} · 掃描日期 {{ relationship_scan.scan_date }}{% if relationship_scan.status not in ['complete', 'unavailable'] %} · 未完成前不計算退出名單{% endif %}</p>
+  {% if relationship_issue_job and relationship_issue_job.error %}
+  <details class="scan-error {{ 'retrying' if relationship_issue_job.status == 'queued' else '' }}" open><summary>{{ '查看本輪暫時失敗原因' if relationship_issue_job.status == 'queued' else '查看本輪失敗原因' }}</summary><p>{{ relationship_issue_job.error }}</p>{% if relationship_issue_job.status == 'queued' %}<time>已保留目前進度；下次最早重試 {{ relationship_issue_job.not_before|localtime }}</time>{% elif relationship_issue_job.finished_at %}<time>發生於 {{ relationship_issue_job.finished_at|localtime }}</time>{% endif %}</details>
   {% endif %}
   {% else %}<p class="muted">尚未開始擷取；下次帳號拜訪後會建立第一輪名單。</p>{% endif %}
   <div class="member-grid">

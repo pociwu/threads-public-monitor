@@ -30,6 +30,7 @@ from app.services.collector import (
     ProfileData,
     RelationshipBatch,
     ThreadsCollector,
+    TransientRelationshipError,
     content_fingerprint,
 )
 from app.services.media import (
@@ -38,7 +39,13 @@ from app.services.media import (
     media_equivalent,
     media_identity,
 )
-from app.services.queue import enqueue_unique, next_account_due, next_batch_time, now_utc
+from app.services.queue import (
+    enqueue_unique,
+    next_account_due,
+    next_batch_time,
+    next_relationship_retry,
+    now_utc,
+)
 
 STREAM_TYPES = ("post", "reply", "repost", "quote")
 RELATIONSHIP_TYPES = ("followers", "following")
@@ -208,9 +215,19 @@ class JobProcessor:
                 select(RelationshipScan).where(
                     RelationshipScan.account_id == account.id,
                     RelationshipScan.relationship_type == relationship_type,
-                    RelationshipScan.scan_date == scan_date,
+                    RelationshipScan.status == "running",
                 )
+                .order_by(RelationshipScan.scan_date, RelationshipScan.id)
+                .limit(1)
             )
+            if scan is None:
+                scan = db.scalar(
+                    select(RelationshipScan).where(
+                        RelationshipScan.account_id == account.id,
+                        RelationshipScan.relationship_type == relationship_type,
+                        RelationshipScan.scan_date == scan_date,
+                    )
+                )
             if scan is None:
                 scan = RelationshipScan(
                     account_id=account.id,
@@ -232,7 +249,7 @@ class JobProcessor:
                 if relationship_type == "followers"
                 else account.following_count
             )
-            if scan.status == "failed" or (
+            if (
                 scan.status == "complete"
                 and expected_count is not None
                 and scan.collected_count < expected_count
@@ -319,7 +336,8 @@ class JobProcessor:
                 saved += 1
 
         db.flush()
-        scan.cursor = batch.cursor
+        previous_cursor = scan.cursor
+        scan.cursor = batch.cursor if saved > 0 else previous_cursor
         scan.collected_count = int(
             db.scalar(
                 select(func.count(RelationshipScanMember.id)).where(
@@ -328,21 +346,28 @@ class JobProcessor:
             )
             or 0
         )
-        if (
-            batch.complete
-            and scan.relationship_type == "followers"
-            and scan.collected_count == 0
-            and (account.follower_count or 0) > 0
-        ):
-            raise CollectionError("粉絲清單尚未載入，拒絕將非空帳號記為空名單")
         expected_count = (
             account.follower_count
             if scan.relationship_type == "followers"
             else account.following_count
         )
+        if (
+            batch.complete
+            and scan.collected_count == 0
+            and expected_count != 0
+        ):
+            label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
+            raise TransientRelationshipError(
+                f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單"
+            )
         reached_known_total = expected_count is None or scan.collected_count >= expected_count
         if batch.complete and reached_known_total:
             self._complete_relationship_scan(db, account, scan)
+        if scan.status == "running" and saved == 0:
+            label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
+            raise TransientRelationshipError(
+                f"Threads {label}清單本批未取得新成員，已保留目前進度"
+            )
         return saved
 
     def _activate_following_scan(
@@ -353,25 +378,36 @@ class JobProcessor:
             select(RelationshipScan).where(
                 RelationshipScan.account_id == account.id,
                 RelationshipScan.relationship_type == "following",
-                RelationshipScan.scan_date == scan_date,
+                RelationshipScan.status == "running",
             )
+            .order_by(RelationshipScan.scan_date, RelationshipScan.id)
+            .limit(1)
         )
+        if scan is None:
+            scan = db.scalar(
+                select(RelationshipScan).where(
+                    RelationshipScan.account_id == account.id,
+                    RelationshipScan.relationship_type == "following",
+                    RelationshipScan.scan_date == scan_date,
+                )
+            )
         if scan is None:
             scan = RelationshipScan(
                 account_id=account.id,
                 relationship_type="following",
                 scan_date=scan_date,
-                status="running" if following_count > 0 else "complete",
-                completed_at=None if following_count > 0 else now_utc(),
+                status="running",
             )
             db.add(scan)
             db.flush()
-        elif following_count > 0 and scan.status in {"unavailable", "failed"}:
+        if scan.status == "failed":
+            return
+        elif following_count > 0 and scan.status == "unavailable":
             scan.status = "running"
             scan.completed_at = None
-        elif following_count == 0:
-            scan.status = "complete"
-            scan.completed_at = now_utc()
+        elif following_count == 0 and scan.status in {"running", "unavailable"}:
+            self._complete_relationship_scan(db, account, scan)
+            return
         if scan.status == "running":
             enqueue_unique(
                 db,
@@ -624,6 +660,7 @@ class JobProcessor:
     def _success(self, db: Session, account: Account, job: Job, run: CollectionRun) -> None:
         now = now_utc()
         job.status = "succeeded"
+        job.error = None
         job.finished_at = now
         run.status = "succeeded"
         run.finished_at = now
@@ -667,6 +704,19 @@ class JobProcessor:
                 .order_by(RelationshipScan.id)
                 .limit(1)
             )
+            if (
+                scan
+                and isinstance(exc, TransientRelationshipError)
+                and not login_required
+                and job.attempts < self.settings.relationship_max_attempts
+            ):
+                job.status = "queued"
+                job.not_before = next_relationship_retry(self.settings, job.attempts)
+                job.started_at = None
+                job.finished_at = None
+                scan.status = "running"
+                scan.completed_at = None
+                return
             if scan:
                 scan.status = "failed"
                 scan.completed_at = now

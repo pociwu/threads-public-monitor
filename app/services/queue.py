@@ -144,6 +144,14 @@ def next_batch_time(settings: Settings) -> datetime:
     )
 
 
+def next_relationship_retry(settings: Settings, attempts: int) -> datetime:
+    """Schedule transient list retries with exponential, long random backoff."""
+    multiplier = 2 ** max(attempts - 1, 0)
+    minimum = settings.relationship_retry_min_delay_seconds * multiplier
+    maximum = settings.relationship_retry_max_delay_seconds * multiplier
+    return now_utc() + timedelta(seconds=random.randint(minimum, maximum))
+
+
 def next_account_due(account: Account, settings: Settings) -> datetime:
     jitter = random.randint(0, settings.schedule_jitter_minutes)
     return now_utc() + timedelta(hours=account.interval_hours, minutes=jitter)

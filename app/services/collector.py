@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import BrowserContext, Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.config import Settings
@@ -16,6 +16,9 @@ from app.services.content_text import clean_content_text
 
 COUNT_RE = re.compile(r"([\d,.]+)\s*([萬万千KkMm]?)")
 POST_ID_RE = re.compile(r"/post/([^/?#]+)")
+ACTIVE_RELATIONSHIP_DIALOG_SELECTOR = (
+    '[role="dialog"]:visible, [aria-modal="true"]:visible'
+)
 
 
 class CollectionError(RuntimeError):
@@ -28,6 +31,10 @@ class LoginRequired(CollectionError):
 
 class RestrictedPage(CollectionError):
     pass
+
+
+class TransientRelationshipError(CollectionError):
+    """A temporary relationship-list failure that may be retried after backoff."""
 
 
 @dataclass(slots=True)
@@ -418,9 +425,15 @@ class ThreadsCollector:
                 opened = self._click_when_available(
                     page,
                     r"""() => {
-                      const dialog = document.querySelector(
+                      const dialog = [...document.querySelectorAll(
                         '[role="dialog"],[aria-modal="true"]'
-                      );
+                      )].find(element => {
+                        const bounds = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        return bounds.width > 0 && bounds.height > 0 &&
+                          style.display !== 'none' && style.visibility !== 'hidden' &&
+                          /粉絲|followers?|追蹤中|following/i.test(element.innerText || '');
+                      });
                       if (!dialog) return false;
                       const controls = [...dialog.querySelectorAll('a,button,[role="button"]')];
                       const target = controls.find(el => /追蹤中|following/i.test(
@@ -436,33 +449,40 @@ class ThreadsCollector:
                     "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
                 )
             page.wait_for_timeout(1000)
-            relationship_counts: dict[str, str | None] = page.evaluate(
-                r"""() => {
-                  const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
-                  const labels = dialog
-                    ? [...dialog.querySelectorAll('a,button,[role="button"]')].map(el =>
-                        [el.getAttribute('aria-label') || '', el.textContent || '']
-                          .join(' ').replace(/\s+/g, ' ').trim()
-                      )
-                    : [];
+            dialog = self._active_relationship_dialog(page)
+            try:
+                dialog.wait_for(state="visible", timeout=10_000)
+            except PlaywrightTimeoutError as exc:
+                self._save_relationship_diagnostic(page, username, relationship_type)
+                raise TransientRelationshipError(
+                    self._relationship_timeout_message(relationship_type)
+                ) from exc
+            relationship_counts: dict[str, str | None] = dialog.evaluate(
+                r"""dialog => {
+                  const labels = [...dialog.querySelectorAll('a,button,[role="button"]')]
+                    .map(el =>
+                      [el.getAttribute('aria-label') || '', el.textContent || '']
+                        .join(' ').replace(/\s+/g, ' ').trim()
+                    );
                   return {
                     followers: labels.find(text => /粉絲|followers?/i.test(text)) || null,
                     following: labels.find(text => /追蹤中|following/i.test(text)) || null
                   };
                 }"""
             )
+            effective_expected_count = self._effective_relationship_count(
+                relationship_type, relationship_counts, expected_count
+            )
             try:
-                self._wait_for_relationship_rows(page, expected_count)
+                self._wait_for_relationship_rows(page, effective_expected_count)
             except PlaywrightTimeoutError as exc:
                 self._save_relationship_diagnostic(page, username, relationship_type)
-                raise CollectionError("Threads 粉絲清單載入逾時，未取得任何成員") from exc
-            raw: dict[str, Any] = page.evaluate(
-                r"""async ({owner, limit, cursor, expectedCount, seenUsernames}) => {
+                raise TransientRelationshipError(
+                    self._relationship_timeout_message(relationship_type)
+                ) from exc
+            raw: dict[str, Any] = dialog.evaluate(
+                r"""async (dialog, {owner, limit, cursor, expectedCount, seenUsernames}) => {
                   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-                  const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
-                  if (!dialog) {
-                    return {members: [], complete: false, cursorFound: !cursor, available: false};
-                  }
                   const candidates = [dialog, ...dialog.querySelectorAll('*')]
                     .filter(el => el.scrollHeight > el.clientHeight + 40);
                   const scroller = candidates.sort(
@@ -477,6 +497,7 @@ class ThreadsCollector:
                   let stagnant = 0;
                   let previousSize = 0;
                   let complete = false;
+                  const hasKnownTotal = Number.isInteger(expectedCount) && expectedCount >= 0;
                   const avatarUrlFrom = root => {
                     const image = root.querySelector('img[src],img[srcset]');
                     if (image?.currentSrc || image?.src) return image.currentSrc || image.src;
@@ -541,10 +562,8 @@ class ThreadsCollector:
                     else stagnant = 0;
                     // Threads often renders an empty dialog before its member rows arrive.
                     // Do not treat that transient state as a complete empty list.
-                    const reachedKnownTotal = expectedCount > 0 && ordered.length >= expectedCount;
-                    const reachedUnknownEnd = !expectedCount && (
-                      ordered.length > 0 || turn >= 12
-                    );
+                    const reachedKnownTotal = hasKnownTotal && ordered.length >= expectedCount;
+                    const reachedUnknownEnd = !hasKnownTotal && ordered.length > 0;
                     if (atEnd && stagnant >= 2 && (reachedKnownTotal || reachedUnknownEnd)) {
                       complete = true;
                       return {
@@ -571,7 +590,7 @@ class ThreadsCollector:
                     "owner": username,
                     "limit": limit,
                     "cursor": cursor,
-                    "expectedCount": expected_count or 0,
+                    "expectedCount": effective_expected_count,
                     "seenUsernames": sorted(seen_usernames or set()),
                 },
             )
@@ -608,12 +627,43 @@ class ThreadsCollector:
         return False
 
     @staticmethod
+    def _active_relationship_dialog(page: Page) -> Locator:
+        return page.locator(ACTIVE_RELATIONSHIP_DIALOG_SELECTOR).filter(
+            has_text=re.compile(r"粉絲|followers?|追蹤中|following", re.I)
+        ).first
+
+    @staticmethod
+    def _relationship_timeout_message(relationship_type: str) -> str:
+        label = "粉絲" if relationship_type == "followers" else "追蹤中"
+        return f"Threads {label}清單載入逾時，未取得任何成員"
+
+    @staticmethod
+    def _effective_relationship_count(
+        relationship_type: str,
+        relationship_counts: dict[str, str | None],
+        fallback: int | None,
+    ) -> int | None:
+        current = parse_count(relationship_counts.get(relationship_type))
+        return current if current is not None else fallback
+
+    @staticmethod
     def _wait_for_relationship_rows(page: Page, expected_count: int | None) -> None:
-        if not expected_count or expected_count <= 0:
+        if expected_count is not None and expected_count <= 0:
             return
-        page.locator(
-            '[role="dialog"] a[href*="/@"], [aria-modal="true"] a[href*="/@"]'
-        ).first.wait_for(state="visible", timeout=30_000)
+        rows = page.locator(
+            '[role="dialog"]:visible a[href*="/@"], '
+            '[aria-modal="true"]:visible a[href*="/@"]'
+        ).first
+        for attempt, timeout in enumerate((30_000, 20_000)):
+            try:
+                rows.wait_for(state="attached", timeout=timeout)
+                return
+            except PlaywrightTimeoutError:
+                if attempt == 1:
+                    raise
+                # Threads sometimes paints an empty dialog shell before its rows.
+                # A passive pause and second observation adds no click or page reload.
+                page.wait_for_timeout(2_500)
 
     def _save_relationship_diagnostic(
         self, page: Page, username: str, relationship_type: str
@@ -627,7 +677,15 @@ class ThreadsCollector:
             debug_dir.mkdir(parents=True, exist_ok=True)
             snapshot = page.evaluate(
                 r"""() => {
-                  const dialog = document.querySelector('[role="dialog"],[aria-modal="true"]');
+                  const dialog = [...document.querySelectorAll(
+                    '[role="dialog"],[aria-modal="true"]'
+                  )].find(element => {
+                    const bounds = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return bounds.width > 0 && bounds.height > 0 &&
+                      style.display !== 'none' && style.visibility !== 'hidden' &&
+                      /粉絲|followers?|追蹤中|following/i.test(element.innerText || '');
+                  });
                   const describe = el => ({
                     tag: el.tagName,
                     role: el.getAttribute('role'),
