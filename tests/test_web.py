@@ -164,6 +164,8 @@ def test_account_detail_renders_threads_like_content_card_structure() -> None:
         assert 'class="content-author-avatar"' in response.text
         assert 'src="/media/avatars/sin_9311.jpg"' in response.text
         assert 'class="content-source"' in response.text
+        assert 'class="content-time-relative"' in response.text
+        assert 'class="content-time-exact">2026/08/20 16:00<' in response.text
         assert 'class="media-carousel"' in response.text
         assert 'class="media-counter">1/2<' in response.text
         assert 'class="content-actions"' in response.text

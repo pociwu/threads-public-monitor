@@ -97,7 +97,7 @@
     </div>
     <div class="content-post">
       <header class="content-author-row">
-        <div class="content-author-meta"><a class="content-author" href="{{ content.source_url }}" target="_blank" rel="noreferrer">{{ content.author_username }}</a>{% if content.content_type != 'post' %}<span class="content-context">{{ {'reply':'回覆','repost':'轉發','quote':'引用轉發'}.get(content.content_type, content.content_type) }}</span>{% endif %}<time class="content-time" title="{{ content.published_at|localtime }}">{{ content.published_at|relative_time }}</time></div>
+        <div class="content-author-meta"><a class="content-author" href="{{ content.source_url }}" target="_blank" rel="noreferrer">{{ content.author_username }}</a>{% if content.content_type != 'post' %}<span class="content-context">{{ {'reply':'回覆','repost':'轉發','quote':'引用轉發'}.get(content.content_type, content.content_type) }}</span>{% endif %}<time class="content-time" title="{{ content.published_at|localtime }}"><span class="content-time-relative">{{ content.published_at|relative_time }}</span>{% if content.published_at %}<span class="content-time-separator" aria-hidden="true">·</span><span class="content-time-exact">{{ content.published_at|localtime }}</span>{% endif %}</time></div>
         {% if content.suspected_removed %}<span class="status status-error">疑似已移除</span>{% endif %}
         <a class="content-source" href="{{ content.source_url }}" target="_blank" rel="noreferrer" aria-label="在 Threads 開啟原文">•••</a>
       </header>

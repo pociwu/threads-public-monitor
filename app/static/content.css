@@ -56,6 +56,18 @@
 
 .content-card header .content-time { margin-left: 0; }
 
+.content-time {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.content-time-exact {
+  color: color-mix(in srgb, var(--muted) 78%, transparent);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
 .content-card header .content-source {
   margin-left: auto;
   padding: 6px 2px;
@@ -161,6 +173,8 @@
   .content-author-avatar,
   .content-author-avatar .avatar { width: 36px; height: 36px; }
   .content-card .content-author-row { min-height: 36px; }
+  .content-author-meta { flex-wrap: wrap; }
+  .content-time { flex-basis: 100%; }
   .content-text { font-size: 15px; }
   .content-actions { gap: 8px; }
   .content-actions a { gap: 4px; font-size: 12px; }
