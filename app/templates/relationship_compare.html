@@ -41,14 +41,15 @@
 <div class="alert warning">請至少再選擇一個帳號。</div>
 {% elif selected_accounts|length >= 2 %}
 <section class="comparison-status">
-  <div class="section-heading"><h2>資料狀態</h2><span class="muted">僅使用最近一次完整掃描</span></div>
+  <div class="section-heading"><h2>資料狀態</h2><span class="muted">{{ '使用最近可比較的完整或部分掃描' if include_partial else '僅使用最近一次完整掃描' }}</span></div>
   <div class="status-grid">
     {% for row in scan_statuses %}
     <article class="status-card">
       <strong>@{{ row.account.username }}</strong>
-      {% for relationship_type,scan_info in row.types.items() %}{% set scan = scan_info.latest %}{% set complete_scan = scan_info.complete %}
+      {% for relationship_type,scan_info in row.types.items() %}{% set scan = scan_info.latest %}{% set complete_scan = scan_info.complete %}{% set selected_scan = scan_info.selected %}
       <p><span>{{ '粉絲' if relationship_type == 'followers' else '追蹤中' }}</span>
         {% if scan and scan.status == 'complete' %}<span class="status status-succeeded">完整 · {{ scan.scan_date }}</span>
+        {% elif selected_scan and selected_scan.status != 'complete' %}<span class="status status-queued">暫定比較 {{ selected_scan.scan_date }} · {{ {'running':'回補中','failed':'失敗'}.get(selected_scan.status, selected_scan.status) }} · 已擷取 {{ selected_scan.collected_count }} 人{% if scan and scan.id != selected_scan.id %} · 最新{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }} {{ scan.scan_date }}{% endif %}</span>
         {% elif complete_scan %}<span class="status status-queued">比較 {{ complete_scan.scan_date }} · 最新{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }}{% if include_partial and scan.collected_count %} · 已擷取 {{ scan.collected_count }} 人{% endif %}</span>
         {% elif scan %}<span class="status status-failed">{{ {'running':'回補中','failed':'失敗','unavailable':'未提供'}.get(scan.status, scan.status) }} · {{ scan.scan_date }}{% if include_partial and scan.collected_count %} · 已擷取 {{ scan.collected_count }} 人{% endif %}</span>
         {% else %}<span class="status status-failed">尚無掃描</span>{% endif %}

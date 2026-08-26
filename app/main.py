@@ -305,6 +305,34 @@ def _latest_relationship_scan(
     )
 
 
+def _latest_nonempty_partial_relationship_scan(
+    db: Session, account_id: int, relationship_type: str
+) -> RelationshipScan | None:
+    has_members = (
+        select(RelationshipScanMember.id)
+        .where(RelationshipScanMember.scan_id == RelationshipScan.id)
+        .exists()
+    )
+    return db.scalar(
+        select(RelationshipScan)
+        .where(
+            RelationshipScan.account_id == account_id,
+            RelationshipScan.relationship_type == relationship_type,
+            RelationshipScan.status.in_({"running", "failed"}),
+            has_members,
+        )
+        .order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc())
+        .limit(1)
+    )
+
+
+def _newest_scan(*scans: RelationshipScan | None) -> RelationshipScan | None:
+    available = [scan for scan in scans if scan is not None]
+    if not available:
+        return None
+    return max(available, key=lambda scan: (scan.scan_date, scan.id))
+
+
 def _comparison_members(
     db: Session, scans: dict[int, RelationshipScan]
 ) -> dict[str, dict]:
@@ -369,9 +397,6 @@ def compare_relationships(
         ("followers", "following") if comparison_type == "both" else (comparison_type,)
     )
     scan_statuses = []
-    complete_scans: dict[str, dict[int, RelationshipScan]] = {
-        relationship_type: {} for relationship_type in needed_types
-    }
     comparison_scans: dict[str, dict[int, RelationshipScan]] = {
         relationship_type: {} for relationship_type in needed_types
     }
@@ -383,17 +408,18 @@ def compare_relationships(
             complete = _latest_relationship_scan(
                 db, account.id, relationship_type, complete_only=True
             )
-            type_statuses[relationship_type] = {"latest": latest, "complete": complete}
-            if complete:
-                complete_scans[relationship_type][account.id] = complete
             selected_scan = complete
-            if (
-                include_partial
-                and latest
-                and latest.status in {"running", "failed"}
-                and latest.collected_count > 0
-            ):
-                selected_scan = latest
+            if include_partial:
+                partial = _latest_nonempty_partial_relationship_scan(
+                    db, account.id, relationship_type
+                )
+                selected_scan = _newest_scan(complete, partial)
+            type_statuses[relationship_type] = {
+                "latest": latest,
+                "complete": complete,
+                "selected": selected_scan,
+            }
+            if selected_scan and selected_scan.status != "complete":
                 provisional_account_ids.add(account.id)
             if selected_scan:
                 comparison_scans[relationship_type][account.id] = selected_scan

@@ -653,3 +653,73 @@ def test_relationship_compare_can_include_partial_scans_as_provisional_results()
     finally:
         app.dependency_overrides.clear()
         db.close()
+
+
+def test_relationship_compare_uses_previous_nonempty_partial_while_latest_is_empty() -> None:
+    client, db = make_client()
+    try:
+        complete_account = Account(username="complete", status="active")
+        partial_account = Account(username="partial", status="active")
+        db.add_all([complete_account, partial_account])
+        db.flush()
+
+        complete_scan = RelationshipScan(
+            account_id=complete_account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 25),
+            status="complete",
+            collected_count=1,
+        )
+        previous_partial_scan = RelationshipScan(
+            account_id=partial_account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 25),
+            status="failed",
+            collected_count=1,
+        )
+        latest_empty_scan = RelationshipScan(
+            account_id=partial_account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 26),
+            status="running",
+            collected_count=0,
+        )
+        db.add_all([complete_scan, previous_partial_scan, latest_empty_scan])
+        db.flush()
+
+        for account, scan in (
+            (complete_account, complete_scan),
+            (partial_account, previous_partial_scan),
+        ):
+            member = RelationshipMember(
+                account_id=account.id,
+                relationship_type="followers",
+                username="known_shared_user",
+                active=True,
+            )
+            db.add(member)
+            db.flush()
+            db.add(RelationshipScanMember(scan_id=scan.id, member_id=member.id))
+        db.commit()
+
+        response = client.get(
+            "/relationships/compare",
+            params=[
+                ("account_ids", complete_account.id),
+                ("account_ids", partial_account.id),
+                ("comparison_type", "followers"),
+                ("min_present", 2),
+                ("include_partial", "true"),
+            ],
+        )
+
+        assert response.status_code == 200
+        assert "@known_shared_user" in response.text
+        assert "出現在 2 / 2 個帳號" in response.text
+        assert "暫定結果" in response.text
+        assert "暫定比較 2026-08-25" in response.text
+        assert "最新回補中 2026-08-26" in response.text
+        assert "1 個帳號缺少所需的完整名單" not in response.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
