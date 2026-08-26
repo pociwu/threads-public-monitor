@@ -31,6 +31,19 @@ LOGIN_PORT=6080
 
 服務只綁定這個 Tailscale IP，不監聽 `0.0.0.0`。
 
+## Telegram 異動通知（選用）
+
+先透過 Telegram 的 `@BotFather` 建立 Bot，並由接收通知的帳號或群組先傳訊息給該 Bot。接著在 `.env` 設定：
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456789:your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+重新啟動服務後，系統會通知增量階段的新串文、新回覆，以及完整掃描後的粉絲／追蹤中名單新增與退出。名單掃描耗盡自動重試並正式失敗時也會通知原因與目前進度；等待自動重試中的暫時失敗不通知。初始回補不會發送大量舊內容；第一次完整名單只建立比較基準，也不會發送異動。通知使用資料庫 Outbox 獨立重試，Telegram 暫時失敗不會影響 Threads 擷取結果。
+
+`TELEGRAM_CHAT_ID` 也可填公開頻道的 `@channel_username`，或頻道的數字 Chat ID。Bot 必須先加入頻道並設為具備發文權限的管理員。
+
 ## 首次登入 Threads
 
 ```bash

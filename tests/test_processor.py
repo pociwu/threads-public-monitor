@@ -18,6 +18,7 @@ from app.models import (
     InteractionSnapshot,
     Job,
     MediaAsset,
+    NotificationOutbox,
     ProfileVersion,
     RelationshipChange,
     RelationshipMember,
@@ -35,6 +36,93 @@ from app.services.collector import (
     TransientRelationshipError,
 )
 from app.services.processor import JobProcessor
+
+
+def test_incremental_content_batch_queues_telegram_notification(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        telegram_bot_token="secret-token",
+        telegram_chat_id="-100123",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        db.add(
+            CollectionStream(
+                account_id=account.id,
+                content_type="post",
+                phase="incremental",
+            )
+        )
+        db.flush()
+
+        processor._save_content_batch(db, account, "post", [FakeCollector.contents[0]])
+        db.flush()
+
+        notification = db.scalar(select(NotificationOutbox))
+        assert notification is not None
+        assert notification.event_type == "content_post"
+        assert "第一則內容" in notification.body
+
+
+def test_complete_relationship_scan_queues_only_real_diff(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        telegram_bot_token="secret-token",
+        telegram_chat_id="-100123",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        alice = RelationshipMember(
+            account_id=account.id,
+            relationship_type="followers",
+            username="alice",
+        )
+        bob = RelationshipMember(
+            account_id=account.id,
+            relationship_type="followers",
+            username="bob",
+        )
+        previous = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 25),
+            status="complete",
+        )
+        current = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 26),
+            status="running",
+        )
+        db.add_all([alice, bob, previous, current])
+        db.flush()
+        db.add_all(
+            [
+                RelationshipScanMember(scan_id=previous.id, member_id=alice.id),
+                RelationshipScanMember(scan_id=current.id, member_id=bob.id),
+            ]
+        )
+        db.flush()
+
+        processor._complete_relationship_scan(db, account, current)
+        db.flush()
+
+        notification = db.scalar(select(NotificationOutbox))
+        assert notification is not None
+        assert "新增 1：@bob" in notification.body
+        assert "退出 1：@alice" in notification.body
 
 
 def make_session() -> Session:
@@ -917,6 +1005,8 @@ def test_transient_relationship_failure_requeues_same_job_after_long_backoff(
         database_url="sqlite:///:memory:",
         media_root=tmp_path / "media",
         browser_profile_dir=tmp_path / "profile",
+        telegram_bot_token="secret-token",
+        telegram_chat_id="-100123",
     )
     with make_session() as db:
         account = Account(username="example", status="active", follower_count=51)
@@ -962,6 +1052,7 @@ def test_transient_relationship_failure_requeues_same_job_after_long_backoff(
         assert scan.completed_at is None
         assert account.status == "active"
         assert db.scalar(select(func.count(Job.id))) == 1
+        assert db.scalar(select(NotificationOutbox)) is None
         run = db.scalar(select(CollectionRun))
         assert run is not None
         assert run.status == "failed"
@@ -977,6 +1068,8 @@ def test_transient_relationship_failure_stops_after_attempt_limit(tmp_path) -> N
         database_url="sqlite:///:memory:",
         media_root=tmp_path / "media",
         browser_profile_dir=tmp_path / "profile",
+        telegram_bot_token="secret-token",
+        telegram_chat_id="-100123",
     )
     with make_session() as db:
         account = Account(username="example", status="active", follower_count=51)
@@ -1008,6 +1101,10 @@ def test_transient_relationship_failure_stops_after_attempt_limit(tmp_path) -> N
         assert scan.completed_at is not None
         assert account.status == "active"
         assert db.scalar(select(func.count(Job.id)).where(Job.status == "queued")) == 0
+        notification = db.scalar(select(NotificationOutbox))
+        assert notification is not None
+        assert notification.event_type == "relationship_followers_failed"
+        assert "載入逾時" in notification.body
 
 
 def test_relationship_login_failure_is_never_automatically_requeued(tmp_path) -> None:

@@ -5,6 +5,7 @@ import time
 
 from app.config import get_settings
 from app.db import SessionLocal, create_schema
+from app.services.notifications import NotificationService
 from app.services.processor import JobProcessor
 from app.services.queue import claim_next_job, schedule_due_accounts
 
@@ -14,6 +15,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("threads-monitor.worker")
+
+
+def deliver_notification() -> None:
+    with SessionLocal() as db:
+        NotificationService(settings).deliver_next(db)
+        db.commit()
 
 
 def run() -> None:
@@ -28,12 +35,14 @@ def run() -> None:
                 job = claim_next_job(db, settings)
                 if not job:
                     db.commit()
+                    deliver_notification()
                     time.sleep(15)
                     continue
                 db.commit()
                 logger.info("執行工作 id=%s kind=%s account=%s", job.id, job.kind, job.account_id)
                 processor.process(db, job)
                 db.commit()
+            deliver_notification()
         except KeyboardInterrupt:
             logger.info("背景 Worker 已停止")
             return

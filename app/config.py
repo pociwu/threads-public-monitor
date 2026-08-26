@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     relationship_max_attempts: int = Field(default=3, ge=1)
     relationship_retry_min_delay_seconds: int = Field(default=2700, ge=0)
     relationship_retry_max_delay_seconds: int = Field(default=5400, ge=0)
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_notification_timeout_seconds: int = Field(default=15, ge=1, le=60)
+    telegram_notification_max_attempts: int = Field(default=5, ge=1, le=20)
     log_level: str = "INFO"
 
     chromium_executable: str = Field(default="/usr/bin/chromium")
@@ -55,6 +59,10 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @property
+    def telegram_notifications_enabled(self) -> bool:
+        return bool(self.telegram_bot_token.strip() and self.telegram_chat_id.strip())
 
     def ensure_directories(self) -> None:
         self.media_root.mkdir(parents=True, exist_ok=True)

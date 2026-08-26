@@ -39,6 +39,7 @@ from app.services.media import (
     media_equivalent,
     media_identity,
 )
+from app.services.notifications import NotificationService
 from app.services.queue import (
     enqueue_unique,
     next_account_due,
@@ -55,6 +56,7 @@ class JobProcessor:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.media = MediaStore(settings)
+        self.notifications = NotificationService(settings)
 
     def process(self, db: Session, job: Job) -> None:
         run = CollectionRun(
@@ -418,9 +420,8 @@ class JobProcessor:
                 not_before=next_batch_time(self.settings),
             )
 
-    @staticmethod
     def _complete_relationship_scan(
-        db: Session, account: Account, scan: RelationshipScan
+        self, db: Session, account: Account, scan: RelationshipScan
     ) -> None:
         now = now_utc()
         previous = db.scalar(
@@ -442,6 +443,8 @@ class JobProcessor:
             ).all()
         )
         previous_ids: set[int] = set()
+        added_usernames: list[str] = []
+        removed_usernames: list[str] = []
         if previous:
             previous_ids = set(
                 db.scalars(
@@ -450,7 +453,19 @@ class JobProcessor:
                     )
                 ).all()
             )
-            for member_id in current_ids - previous_ids:
+            changed_members = {
+                member.id: member.username
+                for member in db.scalars(
+                    select(RelationshipMember).where(
+                        RelationshipMember.id.in_(current_ids ^ previous_ids)
+                    )
+                ).all()
+            }
+            added_ids = current_ids - previous_ids
+            removed_ids = previous_ids - current_ids
+            added_usernames = sorted(changed_members[member_id] for member_id in added_ids)
+            removed_usernames = sorted(changed_members[member_id] for member_id in removed_ids)
+            for member_id in added_ids:
                 db.add(
                     RelationshipChange(
                         account_id=account.id,
@@ -461,7 +476,7 @@ class JobProcessor:
                         observed_date=scan.scan_date,
                     )
                 )
-            for member_id in previous_ids - current_ids:
+            for member_id in removed_ids:
                 db.add(
                     RelationshipChange(
                         account_id=account.id,
@@ -488,6 +503,16 @@ class JobProcessor:
                 member.removed_at = now
         scan.status = "complete"
         scan.completed_at = now
+        if previous:
+            self.notifications.queue_relationship_changes(
+                db,
+                account,
+                scan_id=scan.id,
+                relationship_type=scan.relationship_type,
+                scan_date=scan.scan_date,
+                added=added_usernames,
+                removed=removed_usernames,
+            )
 
     def _schedule_stream(self, db: Session, account: Account) -> None:
         db.flush()
@@ -524,7 +549,9 @@ class JobProcessor:
             stream = CollectionStream(account_id=account.id, content_type=content_type)
             db.add(stream)
             db.flush()
+        starting_phase = stream.phase
         new_count = 0
+        new_items: list[ContentData] = []
         for item in items:
             content = db.scalar(select(Content).where(Content.threads_id == item.threads_id))
             is_new = content is None
@@ -542,6 +569,7 @@ class JobProcessor:
                 db.add(content)
                 db.flush()
                 new_count += 1
+                new_items.append(item)
             content.last_seen_at = now_utc()
             content.unavailable_checks = 0
             content.suspected_removed = False
@@ -654,6 +682,10 @@ class JobProcessor:
         ):
             stream.phase = "incremental"
 
+        self.notifications.queue_content_changes(
+            db, account, starting_phase, content_type, new_items
+        )
+
         self._schedule_stream(db, account)
         return new_count
 
@@ -720,6 +752,15 @@ class JobProcessor:
             if scan:
                 scan.status = "failed"
                 scan.completed_at = now
+                self.notifications.queue_relationship_failure(
+                    db,
+                    account,
+                    scan_id=scan.id,
+                    relationship_type=scan.relationship_type,
+                    scan_date=scan.scan_date,
+                    collected_count=scan.collected_count,
+                    reason=message,
+                )
             if not login_required:
                 return
         account.status_message = message
