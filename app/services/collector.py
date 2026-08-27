@@ -409,7 +409,9 @@ class ThreadsCollector:
             opened = self._click_when_available(
                 page,
                 r"""() => {
-                  const controls = [...document.querySelectorAll('a,button,[role="button"]')];
+                  const controls = [...document.querySelectorAll(
+                    'a,button,[role="button"],[role="tab"]'
+                  )];
                   const target = controls.find(el => {
                     const text = [el.getAttribute('aria-label') || '', el.textContent || '']
                       .join(' ').replace(/\s+/g, ' ').trim();
@@ -435,7 +437,9 @@ class ThreadsCollector:
                           /粉絲|followers?|追蹤中|following/i.test(element.innerText || '');
                       });
                       if (!dialog) return false;
-                      const controls = [...dialog.querySelectorAll('a,button,[role="button"]')];
+                      const controls = [...dialog.querySelectorAll(
+                        'a,button,[role="button"],[role="tab"]'
+                      )];
                       const target = controls.find(el => /追蹤中|following/i.test(
                         [el.getAttribute('aria-label') || '', el.textContent || ''].join(' ')
                       ));
@@ -445,7 +449,8 @@ class ThreadsCollector:
                     }""",
                 )
             if not opened:
-                raise CollectionError(
+                self._save_relationship_diagnostic(page, username, relationship_type)
+                raise TransientRelationshipError(
                     "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
                 )
             page.wait_for_timeout(1000)
@@ -497,6 +502,7 @@ class ThreadsCollector:
                   let stagnant = 0;
                   let previousSize = 0;
                   let complete = false;
+                  let atEnd = false;
                   const hasKnownTotal = Number.isInteger(expectedCount) && expectedCount >= 0;
                   const avatarUrlFrom = root => {
                     const image = root.querySelector('img[src],img[srcset]');
@@ -557,14 +563,18 @@ class ThreadsCollector:
                         cursorFound, available: true
                       };
                     }
-                    const atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
+                    atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
                     if (atEnd && ordered.length === previousSize) stagnant += 1;
                     else stagnant = 0;
                     // Threads often renders an empty dialog before its member rows arrive.
                     // Do not treat that transient state as a complete empty list.
                     const reachedKnownTotal = hasKnownTotal && ordered.length >= expectedCount;
                     const reachedUnknownEnd = !hasKnownTotal && ordered.length > 0;
-                    if (atEnd && stagnant >= 2 && (reachedKnownTotal || reachedUnknownEnd)) {
+                    const reachedAccessibleEnd = ordered.length > 0 && stagnant >= 8;
+                    if (atEnd && (
+                      (stagnant >= 2 && (reachedKnownTotal || reachedUnknownEnd)) ||
+                      reachedAccessibleEnd
+                    )) {
                       complete = true;
                       return {
                         members: afterCursor.slice(0, limit), complete,
@@ -584,7 +594,10 @@ class ThreadsCollector:
                   const members = ordered.slice(start)
                     .filter(member => !previouslySaved.has(member.username))
                     .slice(0, limit);
-                  return {members, complete: false, cursorFound, available: true};
+                  return {
+                    members, complete: false, cursorFound, available: true,
+                    atEnd, stagnant, orderedCount: ordered.length
+                  };
                 }""",
                 {
                     "owner": username,
@@ -610,12 +623,22 @@ class ThreadsCollector:
             return RelationshipBatch(
                 members=members,
                 cursor=members[-1].username if members else cursor,
-                complete=bool(raw.get("complete")),
+                complete=self._relationship_batch_complete(raw),
                 follower_count=parse_count(relationship_counts.get("followers")),
                 following_count=parse_count(relationship_counts.get("following")),
             )
         finally:
             page.close()
+
+    @staticmethod
+    def _relationship_batch_complete(raw: dict[str, Any]) -> bool:
+        if raw.get("complete"):
+            return True
+        return bool(
+            raw.get("atEnd")
+            and int(raw.get("stagnant") or 0) >= 8
+            and int(raw.get("orderedCount") or 0) > 0
+        )
 
     @staticmethod
     def _click_when_available(page: Page, script: str, attempts: int = 60) -> bool:

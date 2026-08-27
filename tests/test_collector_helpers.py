@@ -7,6 +7,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from app.config import Settings
 from app.services.collector import (
     ThreadsCollector,
+    TransientRelationshipError,
     content_fingerprint,
     parse_count,
     parse_labeled_count,
@@ -279,6 +280,65 @@ def test_relationship_control_retries_until_threads_renders_it() -> None:
 
     assert ThreadsCollector._click_when_available(page, "script", attempts=60) is True
     assert page.waits == [500, 500]
+
+
+def test_missing_relationship_control_is_retryable_and_saves_diagnostic(tmp_path) -> None:
+    class FakePage:
+        def __init__(self):
+            self.closed = False
+            self.scripts = []
+
+        def evaluate(self, script):
+            self.scripts.append(script)
+            return len(self.scripts) == 1
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    page = FakePage()
+    diagnostics = []
+    collector._page = lambda _url: page
+    collector._save_relationship_diagnostic = (
+        lambda _page, username, relationship_type: diagnostics.append(
+            (username, relationship_type)
+        )
+    )
+
+    with pytest.raises(TransientRelationshipError, match="清單控制項"):
+        collector.collect_relationships("example", "following")
+
+    assert diagnostics == [("example", "following")]
+    assert '[role="tab"]' in page.scripts[0]
+    assert '[role="tab"]' in page.scripts[1]
+    assert page.closed is True
+
+
+def test_accessible_relationship_end_can_complete_below_profile_count() -> None:
+    assert ThreadsCollector._relationship_batch_complete(
+        {
+            "complete": False,
+            "atEnd": True,
+            "stagnant": 8,
+            "orderedCount": 122,
+        }
+    ) is True
+    assert ThreadsCollector._relationship_batch_complete(
+        {
+            "complete": False,
+            "atEnd": True,
+            "stagnant": 2,
+            "orderedCount": 122,
+        }
+    ) is False
 
 
 def test_content_text_excludes_trailing_threads_ui_numbers() -> None:
