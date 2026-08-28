@@ -260,6 +260,61 @@ def test_account_detail_lists_completed_and_pending_backfill_streams() -> None:
         db.close()
 
 
+def test_account_can_schedule_staggered_existing_content_refreshes() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        stored_contents = [
+            Content(
+                threads_id="old-1",
+                account_id=account.id,
+                author_username="example",
+                content_type="post",
+                source_url="https://www.threads.com/@example/post/old-1",
+                published_at=datetime(2026, 1, 1),
+            ),
+            Content(
+                threads_id="old-2",
+                account_id=account.id,
+                author_username="example",
+                content_type="reply",
+                source_url="https://www.threads.com/@example/post/old-2",
+                published_at=datetime(2026, 1, 2),
+            ),
+        ]
+        db.add_all(stored_contents)
+        db.commit()
+
+        response = client.post(
+            f"/accounts/{account.id}/refresh-content", follow_redirects=False
+        )
+
+        assert response.status_code == 303
+        jobs = db.scalars(
+            select(Job)
+            .where(Job.account_id == account.id, Job.kind == "content_refresh")
+            .order_by(Job.not_before, Job.id)
+        ).all()
+        assert [job.content_id for job in jobs] == [item.id for item in stored_contents]
+        assert jobs[0].not_before < jobs[1].not_before
+        assert "refresh_queued=2" in response.headers["location"]
+
+        second = client.post(
+            f"/accounts/{account.id}/refresh-content", follow_redirects=False
+        )
+        assert "refresh_queued=0" in second.headers["location"]
+        assert len(db.scalars(select(Job).where(Job.kind == "content_refresh")).all()) == 2
+
+        page = client.get(f"/accounts/{account.id}")
+        assert "排定更新舊貼文" in page.text
+        assert "2 筆等待更新" in page.text
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
 def test_retry_moves_login_required_account_back_to_pending() -> None:
     client, db = make_client()
     try:

@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Account, Job, RuntimeState
+from app.models import Account, Content, Job, RuntimeState
 
 GLOBAL_NEXT_BATCH_KEY = "global-next-batch-at"
 
@@ -21,6 +21,7 @@ def enqueue_unique(
     *,
     kind: str,
     account_id: int | None,
+    content_id: int | None = None,
     content_type: str | None = None,
     priority: int = 100,
     not_before: datetime | None = None,
@@ -28,6 +29,7 @@ def enqueue_unique(
     existing = db.scalar(
         select(Job).where(
             Job.account_id == account_id,
+            Job.content_id == content_id,
             Job.kind == kind,
             Job.content_type == content_type,
             Job.status.in_(["queued", "running"]),
@@ -37,6 +39,7 @@ def enqueue_unique(
         return None
     job = Job(
         account_id=account_id,
+        content_id=content_id,
         kind=kind,
         content_type=content_type,
         priority=priority,
@@ -45,6 +48,47 @@ def enqueue_unique(
     db.add(job)
     db.flush()
     return job
+
+
+def schedule_content_refreshes(db: Session, settings: Settings, account_id: int) -> int:
+    """Queue stored content refreshes with cumulative global-safe spacing."""
+    active_content_ids = set(
+        db.scalars(
+            select(Job.content_id).where(
+                Job.account_id == account_id,
+                Job.kind == "content_refresh",
+                Job.status.in_(["queued", "running"]),
+                Job.content_id.is_not(None),
+            )
+        ).all()
+    )
+    if active_content_ids:
+        return 0
+    content_ids = db.scalars(
+        select(Content.id)
+        .where(Content.account_id == account_id)
+        .order_by(Content.published_at.asc().nullsfirst(), Content.id)
+    ).all()
+    scheduled_at = now_utc()
+    queued = 0
+    for content_id in content_ids:
+        scheduled_at += timedelta(
+            seconds=random.randint(
+                settings.batch_min_delay_seconds,
+                settings.batch_max_delay_seconds,
+            )
+        )
+        job = enqueue_unique(
+            db,
+            kind="content_refresh",
+            account_id=account_id,
+            content_id=content_id,
+            priority=50,
+            not_before=scheduled_at,
+        )
+        if job:
+            queued += 1
+    return queued
 
 
 def schedule_due_accounts(db: Session, settings: Settings) -> int:

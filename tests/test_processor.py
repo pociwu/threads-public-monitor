@@ -302,6 +302,128 @@ def test_content_job_saves_version_and_changed_metrics(tmp_path) -> None:
         assert metrics.like_count == 3
 
 
+def test_content_refresh_job_updates_existing_post_without_scheduling_stream(tmp_path) -> None:
+    refreshed_at = datetime(2026, 8, 20, 2, 53)
+
+    class RefreshCollector(FakeCollector):
+        def collect_content_url(self, source_url, username, content_type):
+            assert source_url.endswith("/old-post")
+            assert username == "example"
+            assert content_type == "post"
+            return ContentData(
+                threads_id="old-post",
+                author_username="example",
+                content_type="post",
+                source_url=source_url,
+                text="更新後格式",
+                published_at=refreshed_at,
+                like_count=3000,
+                reply_count=36,
+                repost_count=45,
+                share_count=2000,
+            )
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        content = Content(
+            threads_id="old-post",
+            account_id=account.id,
+            author_username="example",
+            content_type="post",
+            source_url="https://www.threads.com/@example/post/old-post",
+            published_at=None,
+        )
+        db.add(content)
+        db.flush()
+        db.add(ContentVersion(content_id=content.id, text="舊格式", fingerprint="old"))
+        job = Job(
+            account_id=account.id,
+            content_id=content.id,
+            kind="content_refresh",
+            status="running",
+        )
+        db.add(job)
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", RefreshCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        versions = db.scalars(
+            select(ContentVersion)
+            .where(ContentVersion.content_id == content.id)
+            .order_by(ContentVersion.id)
+        ).all()
+        metrics = db.scalar(
+            select(InteractionSnapshot)
+            .where(InteractionSnapshot.content_id == content.id)
+            .order_by(InteractionSnapshot.id.desc())
+        )
+        assert job.status == "succeeded"
+        assert content.published_at == refreshed_at
+        assert versions[-1].text == "更新後格式"
+        assert metrics is not None
+        assert (
+            metrics.like_count,
+            metrics.reply_count,
+            metrics.repost_count,
+            metrics.share_count,
+        ) == (3000, 36, 45, 2000)
+        assert db.scalar(select(Job).where(Job.kind == "content")) is None
+
+
+def test_content_refresh_failure_does_not_mark_account_as_failed(tmp_path) -> None:
+    class FailingRefreshCollector(FakeCollector):
+        def collect_content_url(self, *_args):
+            raise CollectionError("舊貼文目前無法存取")
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add(account)
+        db.flush()
+        content = Content(
+            threads_id="old-post",
+            account_id=account.id,
+            author_username="example",
+            content_type="post",
+            source_url="https://www.threads.com/@example/post/old-post",
+        )
+        db.add(content)
+        db.flush()
+        job = Job(
+            account_id=account.id,
+            content_id=content.id,
+            kind="content_refresh",
+            status="running",
+        )
+        db.add(job)
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", FailingRefreshCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert job.status == "failed"
+        assert job.error == "舊貼文目前無法存取"
+        assert account.status == "active"
+        assert account.status_message is None
+        assert account.consecutive_failures == 0
+
+
 def test_content_batch_links_canonical_media_only_once_for_duplicate_bytes(tmp_path) -> None:
     class CanonicalMediaStore:
         def __init__(self):

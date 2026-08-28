@@ -413,6 +413,42 @@ def test_interaction_counts_pair_button_text_with_accessible_labels() -> None:
     }
 
 
+def test_interaction_counts_use_numbers_next_to_icon_controls() -> None:
+    controls = [
+        {"text": "", "label": "讚", "nearby": "3K"},
+        {"text": "", "label": "回覆", "nearby": "36"},
+        {"text": "", "label": "轉發", "nearby": "45"},
+        {"text": "", "label": "分享", "nearby": "2K"},
+    ]
+
+    assert ThreadsCollector._button_counts(controls) == {
+        "like_count": 3000,
+        "reply_count": 36,
+        "repost_count": 45,
+        "share_count": 2000,
+    }
+
+
+def test_interaction_counts_fall_back_to_inline_metric_summary() -> None:
+    assert ThreadsCollector._button_counts(
+        [], "貼文正文\n讚3.2 萬回覆256轉發1,725分享3,229"
+    ) == {
+        "like_count": 32000,
+        "reply_count": 256,
+        "repost_count": 1725,
+        "share_count": 3229,
+    }
+
+
+def test_interaction_counts_do_not_treat_post_prose_as_a_metric_summary() -> None:
+    assert ThreadsCollector._button_counts([], "今天想分享1個故事") == {
+        "like_count": None,
+        "reply_count": None,
+        "repost_count": None,
+        "share_count": None,
+    }
+
+
 def test_collector_stops_playwright_when_browser_launch_fails(monkeypatch, tmp_path) -> None:
     class FailingChromium:
         def launch_persistent_context(self, *_args, **_kwargs):

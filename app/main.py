@@ -32,7 +32,7 @@ from app.models import (
 )
 from app.services.content_text import clean_content_text
 from app.services.media import media_usage_bytes, media_usage_percent
-from app.services.queue import enqueue_unique, now_utc
+from app.services.queue import enqueue_unique, now_utc, schedule_content_refreshes
 from app.services.usernames import InvalidUsername, normalize_username
 
 settings = get_settings()
@@ -289,6 +289,18 @@ def update_interval(
     account.interval_hours = interval_hours
     db.commit()
     return RedirectResponse(f"/accounts/{account_id}", status_code=303)
+
+
+@app.post("/accounts/{account_id}/refresh-content")
+def refresh_account_content(account_id: int, db: Session = Depends(get_db)):
+    account = db.get(Account, account_id)
+    if not account or not account.enabled:
+        raise HTTPException(404)
+    queued = schedule_content_refreshes(db, settings, account.id)
+    db.commit()
+    return RedirectResponse(
+        f"/accounts/{account_id}?refresh_queued={queued}", status_code=303
+    )
 
 
 def _latest_relationship_scan(
@@ -655,6 +667,19 @@ def account_detail(
         ).all()
         has_next = len(relationship_changes) > 100
         relationship_changes = relationship_changes[:100]
+    content_total = int(
+        db.scalar(select(func.count(Content.id)).where(Content.account_id == account.id)) or 0
+    )
+    content_refresh_pending = int(
+        db.scalar(
+            select(func.count(Job.id)).where(
+                Job.account_id == account.id,
+                Job.kind == "content_refresh",
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        or 0
+    )
     return templates.TemplateResponse(
         request,
         "account.html",
@@ -673,6 +698,9 @@ def account_detail(
             "chart_data": chart_data,
             "stream_views": _stream_views(account),
             "backfill_limit": settings.backfill_limit,
+            "content_total": content_total,
+            "content_refresh_pending": content_refresh_pending,
+            "refresh_queued": request.query_params.get("refresh_queued"),
             "avatar_url": f"/media/{account.avatar.local_path}"
             if account.avatar and account.avatar.local_path
             else None,

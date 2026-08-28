@@ -43,6 +43,12 @@
   </div>
 </details>
 
+<section class="profile-panel content-refresh-panel">
+  <div class="section-heading"><div><h2>舊貼文重新整理</h2><p class="muted">逐篇重新開啟已保存的原文，更新真實發文時間、文字格式、互動數與媒體；沿用單一 Worker 及全域安全間隔。</p></div><span class="muted">{{ content_refresh_pending }} 筆等待更新 · 共 {{ content_total }} 筆</span></div>
+  {% if refresh_queued is not none %}<p class="scan-summary"><span class="status status-{{ 'queued' if refresh_queued|int > 0 else 'muted' }}">{{ '已新增 ' ~ refresh_queued ~ ' 筆工作' if refresh_queued|int > 0 else '沒有新增工作' }}</span>{% if refresh_queued|int == 0 and content_refresh_pending %} 現有舊貼文已在排程中。{% elif refresh_queued|int == 0 %} 尚無可排定的舊貼文。{% endif %}</p>{% endif %}
+  <form method="post" action="/accounts/{{ account.id }}/refresh-content"><button class="button" type="submit" {{ 'disabled' if not content_total else '' }}>排定更新舊貼文</button></form>
+</section>
+
 <nav class="tabs">
   {% for key,label in [('all','全部'),('post','串文'),('reply','回覆'),('repost','轉發'),('quote','引用轉發'),('media','影音'),('followers','粉絲名單'),('following','追蹤中'),('changes','每日差異'),('runs','擷取紀錄')] %}
   <a class="{{ 'active' if tab == key else '' }}" href="/accounts/{{ account.id }}?tab={{ key }}">{{ label }}</a>

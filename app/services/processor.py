@@ -92,6 +92,31 @@ class JobProcessor:
                         cursor=stream.cursor if stream and stream.phase == "backfill" else None,
                     )
                     run.item_count = self._save_content_batch(db, account, job.content_type, items)
+                elif job.kind == "content_refresh" and job.content_id is not None:
+                    content = db.scalar(
+                        select(Content).where(
+                            Content.id == job.content_id,
+                            Content.account_id == account.id,
+                        )
+                    )
+                    if content is None:
+                        raise CollectionError("找不到要更新的舊貼文")
+                    run.content_type = content.content_type
+                    item = collector.collect_content_url(
+                        content.source_url,
+                        account.username,
+                        content.content_type,
+                    )
+                    if item.threads_id != content.threads_id:
+                        raise CollectionError("Threads 回傳的貼文與排定更新目標不一致")
+                    self._save_content_batch(
+                        db,
+                        account,
+                        content.content_type,
+                        [item],
+                        schedule_stream=False,
+                    )
+                    run.item_count = 1
                 elif job.kind == "relationship" and job.content_type in RELATIONSHIP_TYPES:
                     scan = self._current_relationship_scan(db, account, job.content_type)
                     if not scan:
@@ -537,19 +562,27 @@ class JobProcessor:
             )
 
     def _save_content_batch(
-        self, db: Session, account: Account, content_type: str, items: list[ContentData]
+        self,
+        db: Session,
+        account: Account,
+        content_type: str,
+        items: list[ContentData],
+        *,
+        schedule_stream: bool = True,
     ) -> int:
-        stream = db.scalar(
-            select(CollectionStream).where(
-                CollectionStream.account_id == account.id,
-                CollectionStream.content_type == content_type,
+        stream = None
+        if schedule_stream:
+            stream = db.scalar(
+                select(CollectionStream).where(
+                    CollectionStream.account_id == account.id,
+                    CollectionStream.content_type == content_type,
+                )
             )
-        )
-        if not stream:
-            stream = CollectionStream(account_id=account.id, content_type=content_type)
-            db.add(stream)
-            db.flush()
-        starting_phase = stream.phase
+            if not stream:
+                stream = CollectionStream(account_id=account.id, content_type=content_type)
+                db.add(stream)
+                db.flush()
+        starting_phase = stream.phase if stream else "incremental"
         new_count = 0
         new_items: list[ContentData] = []
         for item in items:
@@ -570,6 +603,17 @@ class JobProcessor:
                 db.flush()
                 new_count += 1
                 new_items.append(item)
+            else:
+                content.author_username = item.author_username or content.author_username
+                content.content_type = item.content_type or content.content_type
+                content.source_url = item.source_url or content.source_url
+                content.published_at = item.published_at or content.published_at
+                content.reply_to_threads_id = (
+                    item.reply_to_threads_id or content.reply_to_threads_id
+                )
+                content.quoted_threads_id = (
+                    item.quoted_threads_id or content.quoted_threads_id
+                )
             content.last_seen_at = now_utc()
             content.unavailable_checks = 0
             content.suspected_removed = False
@@ -666,27 +710,29 @@ class JobProcessor:
                     )
                 )
 
-        stream.last_collected_at = now_utc()
-        stream.collected_count = int(
-            db.scalar(
-                select(func.count(Content.id)).where(
-                    Content.account_id == account.id, Content.content_type == content_type
+        if stream:
+            stream.last_collected_at = now_utc()
+            stream.collected_count = int(
+                db.scalar(
+                    select(func.count(Content.id)).where(
+                        Content.account_id == account.id,
+                        Content.content_type == content_type,
+                    )
                 )
+                or 0
             )
-            or 0
-        )
-        stream.cursor = items[-1].threads_id if items else stream.cursor
-        stream.empty_batches = stream.empty_batches + 1 if new_count == 0 else 0
-        if stream.phase == "backfill" and (
-            stream.collected_count >= self.settings.backfill_limit or stream.empty_batches >= 2
-        ):
-            stream.phase = "incremental"
+            stream.cursor = items[-1].threads_id if items else stream.cursor
+            stream.empty_batches = stream.empty_batches + 1 if new_count == 0 else 0
+            if stream.phase == "backfill" and (
+                stream.collected_count >= self.settings.backfill_limit
+                or stream.empty_batches >= 2
+            ):
+                stream.phase = "incremental"
 
-        self.notifications.queue_content_changes(
-            db, account, starting_phase, content_type, new_items
-        )
-
-        self._schedule_stream(db, account)
+            self.notifications.queue_content_changes(
+                db, account, starting_phase, content_type, new_items
+            )
+            self._schedule_stream(db, account)
         return new_count
 
     def _success(self, db: Session, account: Account, job: Job, run: CollectionRun) -> None:
@@ -763,6 +809,8 @@ class JobProcessor:
                 )
             if not login_required:
                 return
+        if job.kind == "content_refresh" and not login_required:
+            return
         account.status_message = message
         if login_required:
             account.status = "login_required"

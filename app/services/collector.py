@@ -311,22 +311,72 @@ class ThreadsCollector:
                 page.wait_for_timeout(800)
                 if cursor and page.locator(f'a[href*="/post/{cursor}"]').count():
                     break
-            raw_items: list[dict[str, Any]] = page.evaluate(
-                r"""({username, limit}) => {
+            return self._content_items_from_page(
+                page,
+                username,
+                content_type,
+                limit,
+                cursor=cursor,
+            )
+        finally:
+            page.close()
+
+    def collect_content_url(
+        self,
+        source_url: str,
+        username: str,
+        content_type: str,
+    ) -> ContentData:
+        post_match = POST_ID_RE.search(source_url)
+        if not post_match:
+            raise CollectionError("舊貼文網址格式無效")
+        target_id = post_match.group(1)
+        page = self._page(source_url)
+        try:
+            page.wait_for_timeout(1200)
+            items = self._content_items_from_page(
+                page,
+                username,
+                content_type,
+                1,
+                target_id=target_id,
+            )
+            if not items:
+                raise CollectionError("Threads 舊貼文目前無法存取或尚未載入")
+            return items[0]
+        finally:
+            page.close()
+
+    def _content_items_from_page(
+        self,
+        page: Page,
+        username: str,
+        content_type: str,
+        limit: int,
+        *,
+        cursor: str | None = None,
+        target_id: str | None = None,
+    ) -> list[ContentData]:
+        raw_items: list[dict[str, Any]] = page.evaluate(
+            r"""({username, limit, targetId}) => {
                   const results = [];
                   const seen = new Set();
                   const anchors = [...document.querySelectorAll('a[href*="/post/"]')];
                   for (const anchor of anchors) {
                     const href = anchor.href;
                     const id = (href.match(/\/post\/([^/?#]+)/) || [])[1];
-                    if (!id || seen.has(id)) continue;
+                    if (!id || seen.has(id) || (targetId && id !== targetId)) continue;
                     let root = anchor;
                     for (let i = 0; i < 7 && root.parentElement; i++) {
                       root = root.parentElement;
-                      if (root.querySelectorAll('button').length >= 3 && root.innerText.length > 10) break;
+                      if (
+                        root.querySelectorAll('button,[role="button"]').length >= 3 &&
+                        root.innerText.length > 10
+                      ) break;
                     }
                     const textRoot = root.cloneNode(true);
-                    textRoot.querySelectorAll('button,time').forEach(el => el.remove());
+                    textRoot.querySelectorAll('button,time,a[aria-label]')
+                      .forEach(el => el.remove());
                     const text = textRoot.innerText || textRoot.textContent || '';
                     const authorLink = root.querySelector('a[href^="/@"]');
                     const time = root.querySelector('time');
@@ -335,10 +385,26 @@ class ThreadsCollector:
                       type: el.tagName === 'VIDEO' ? 'video' : 'image',
                       alt: el.alt || ''
                     })).filter(m => m.url && !/profile|大頭貼/i.test(m.alt));
-                    const buttons = [...root.querySelectorAll('button')].map(b => ({
-                      text: b.innerText || '',
-                      label: b.getAttribute('aria-label') || ''
-                    }));
+                    const buttons = [...root.querySelectorAll(
+                      'button,a[aria-label],[role="button"]'
+                    )].map(control => {
+                      const nestedLabel = control.querySelector('[aria-label]')
+                        ?.getAttribute('aria-label') || '';
+                      const siblingText = [
+                        control.previousElementSibling?.innerText || '',
+                        control.nextElementSibling?.innerText || ''
+                      ].join(' ').trim();
+                      const parentText = control.parentElement?.innerText || '';
+                      return {
+                        text: control.innerText || '',
+                        label: [
+                          control.getAttribute('aria-label') || '',
+                          control.getAttribute('title') || '',
+                          nestedLabel
+                        ].join(' ').trim(),
+                        nearby: siblingText || (parentText.length < 80 ? parentText : '')
+                      };
+                    });
                     const postIds = [...root.querySelectorAll('a[href*="/post/"]')]
                       .map(a => ((a.href.match(/\/post\/([^/?#]+)/) || [])[1])).filter(Boolean);
                     seen.add(id);
@@ -348,50 +414,48 @@ class ThreadsCollector:
                   }
                   return results;
                 }""",
-                {"username": username, "limit": limit},
+            {"username": username, "limit": limit, "targetId": target_id},
+        )
+        if cursor:
+            cursor_index = next(
+                (index for index, raw in enumerate(raw_items) if raw.get("id") == cursor), -1
             )
-            if cursor:
-                cursor_index = next(
-                    (index for index, raw in enumerate(raw_items) if raw.get("id") == cursor), -1
+            raw_items = raw_items[cursor_index + 1 :] if cursor_index >= 0 else []
+        items: list[ContentData] = []
+        for raw in raw_items:
+            post_match = POST_ID_RE.search(raw.get("href", ""))
+            if not post_match:
+                continue
+            author = raw.get("authorHref", "").split("/@")[-1].split("/")[0] or username
+            post_ids = set(raw.get("postIds", []))
+            if content_type in {"repost", "quote"}:
+                actual_type = (
+                    "quote"
+                    if author.lower() == username.lower() and len(post_ids) > 1
+                    else "repost"
                 )
-                raw_items = raw_items[cursor_index + 1 :] if cursor_index >= 0 else []
-            items: list[ContentData] = []
-            for raw in raw_items:
-                post_match = POST_ID_RE.search(raw.get("href", ""))
-                if not post_match:
+                if actual_type != content_type:
                     continue
-                author = raw.get("authorHref", "").split("/@")[-1].split("/")[0] or username
-                post_ids = set(raw.get("postIds", []))
-                if content_type in {"repost", "quote"}:
-                    actual_type = (
-                        "quote"
-                        if author.lower() == username.lower() and len(post_ids) > 1
-                        else "repost"
-                    )
-                    if actual_type != content_type:
-                        continue
-                else:
-                    actual_type = content_type
-                counts = self._button_counts(raw.get("buttons", []))
-                cleaned_text = self._clean_content_text(raw.get("text", ""), author)
-                media = [(m["url"], m["type"]) for m in raw.get("media", []) if m.get("url")]
-                items.append(
-                    ContentData(
-                        threads_id=post_match.group(1),
-                        author_username=author,
-                        content_type=actual_type,
-                        source_url=raw["href"],
-                        text=cleaned_text,
-                        published_at=_parse_datetime(raw.get("datetime")),
-                        media=media,
-                        **counts,
-                    )
+            else:
+                actual_type = content_type
+            counts = self._button_counts(raw.get("buttons", []), raw.get("text", ""))
+            cleaned_text = self._clean_content_text(raw.get("text", ""), author)
+            media = [(m["url"], m["type"]) for m in raw.get("media", []) if m.get("url")]
+            items.append(
+                ContentData(
+                    threads_id=post_match.group(1),
+                    author_username=author,
+                    content_type=actual_type,
+                    source_url=raw["href"],
+                    text=cleaned_text,
+                    published_at=_parse_datetime(raw.get("datetime")),
+                    media=media,
+                    **counts,
                 )
-                if len(items) >= limit:
-                    break
-            return items
-        finally:
-            page.close()
+            )
+            if len(items) >= limit:
+                break
+        return items
 
     def collect_relationships(
         self,
@@ -755,7 +819,9 @@ class ThreadsCollector:
         return clean_content_text(value, author)
 
     @staticmethod
-    def _button_counts(buttons: list[dict[str, str] | str]) -> dict[str, int | None]:
+    def _button_counts(
+        buttons: list[dict[str, str] | str], fallback_text: str | None = None
+    ) -> dict[str, int | None]:
         result = {
             "like_count": None,
             "reply_count": None,
@@ -764,21 +830,53 @@ class ThreadsCollector:
         }
         mapping = {
             "like_count": re.compile(r"讚|like", re.I),
-            "reply_count": re.compile(r"留言|回覆|repl", re.I),
-            "repost_count": re.compile(r"轉發|repost", re.I),
-            "share_count": re.compile(r"分享|share", re.I),
+            "reply_count": re.compile(r"留言|回覆|repl(?:y|ies)?", re.I),
+            "repost_count": re.compile(r"轉發|reposts?", re.I),
+            "share_count": re.compile(r"分享|shares?", re.I),
         }
         for button in buttons:
             if isinstance(button, dict):
                 text = button.get("text", "")
                 label = button.get("label", "")
+                nearby = button.get("nearby", "")
                 descriptor = f"{label} {text}".strip()
             else:
                 text = button
+                label = ""
+                nearby = ""
                 descriptor = button
             for key, pattern in mapping.items():
                 if pattern.search(descriptor):
-                    result[key] = parse_count(text) or parse_count(descriptor)
+                    for candidate in (text, label, nearby, descriptor):
+                        count = parse_count(candidate)
+                        if count is not None:
+                            result[key] = count
+                            break
+
+        fallback_metric_labels = sum(
+            bool(pattern.search(fallback_text or "")) for pattern in mapping.values()
+        )
+        if fallback_metric_labels < 2:
+            return result
+
+        count_token = r"[\d,.]+\s*[萬万千KkMm]?"
+        for key, pattern in mapping.items():
+            if result[key] is not None:
+                continue
+            label_pattern = pattern.pattern
+            labeled_count = re.search(
+                rf"(?:{label_pattern})\s*[:：]?\s*({count_token})",
+                fallback_text or "",
+                re.I,
+            )
+            count_labeled = re.search(
+                rf"({count_token})\s*(?:{label_pattern})",
+                fallback_text or "",
+                re.I,
+            )
+            match = labeled_count or count_labeled
+            if match:
+                result[key] = parse_count(match.group(1))
         return result
 
 

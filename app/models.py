@@ -290,6 +290,9 @@ class Job(Base):
     account_id: Mapped[int | None] = mapped_column(
         ForeignKey("accounts.id", ondelete="CASCADE"), index=True
     )
+    content_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contents.id", ondelete="CASCADE"), index=True
+    )
     kind: Mapped[str] = mapped_column(String(32))
     content_type: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
