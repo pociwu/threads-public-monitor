@@ -29,9 +29,12 @@ fi
 
 rollback() {
   echo "更新失敗，正在回復 ${previous_ref}。" >&2
+  trap - ERR
   git checkout --detach "$previous_ref"
-  if [[ -f "$backup_path" ]]; then cp "$backup_path" data/threads-monitor.db; fi
   docker compose build
+  if [[ -f "$backup_path" ]]; then
+    docker compose run --rm web sqlite3 /data/threads-monitor.db ".restore '/backups/threads-monitor-${timestamp}.db'"
+  fi
   docker compose up -d web worker
 }
 trap rollback ERR
