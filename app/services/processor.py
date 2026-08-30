@@ -28,6 +28,7 @@ from app.services.collector import (
     ContentData,
     LoginRequired,
     ProfileData,
+    RateLimited,
     RelationshipBatch,
     ThreadsCollector,
     TransientRelationshipError,
@@ -41,6 +42,7 @@ from app.services.media import (
 )
 from app.services.notifications import NotificationService
 from app.services.queue import (
+    defer_for_rate_limit,
     enqueue_unique,
     next_account_due,
     next_batch_time,
@@ -159,6 +161,8 @@ class JobProcessor:
                         priority=40,
                         not_before=next_batch_time(self.settings),
                     )
+        except RateLimited as exc:
+            self._rate_limited(db, job, run, exc)
         except LoginRequired as exc:
             self._failure(db, job, run, exc, login_required=True)
         except Exception as exc:
@@ -749,6 +753,38 @@ class JobProcessor:
         if account.status not in {"pending", "login_required"}:
             account.status = "active"
             account.status_message = None
+
+    def _rate_limited(
+        self,
+        db: Session,
+        job: Job,
+        run: CollectionRun,
+        exc: RateLimited,
+    ) -> None:
+        """Preserve the current job while a shared Threads cooldown is active."""
+        now = now_utc()
+        message = str(exc)[:1000]
+        retry_at, _hits = defer_for_rate_limit(
+            db,
+            self.settings,
+            retry_after_seconds=exc.retry_after_seconds,
+            reason=message,
+        )
+
+        job.status = "queued"
+        job.attempts = max(job.attempts - 1, 0)
+        job.not_before = retry_at
+        job.started_at = None
+        job.finished_at = None
+        job.error = message
+
+        run.status = "failed"
+        run.message = message
+        run.finished_at = now
+
+        account = db.get(Account, job.account_id) if job.account_id else None
+        if account:
+            account.last_attempt_at = now
 
     def _failure(
         self,

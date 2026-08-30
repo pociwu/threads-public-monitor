@@ -52,6 +52,22 @@ bash scripts/login.sh
 
 腳本會先停止背景 Worker，再按需啟動互動式 Chromium。從提示的 Tailscale 網址開啟 noVNC，親自登入專用 Threads 帳號；完成後回到終端按 Enter。密碼不會送入本應用程式或資料庫。
 
+## 擷取節流與 429 冷卻
+
+系統只使用單一背景 Worker，預設每個 Threads 批次之間隨機等待 3–8 分鐘、每日最多執行 200 個批次，名單每批最多保存 5 人。這些限制可降低短時間密集請求，但不代表 Threads 一定不會限流。
+
+若 Threads 明確回傳 HTTP 429，或顯示「請稍後再試／Too many requests」限流頁，系統會把所有 Threads 擷取工作暫停並將冷卻狀態保存到 SQLite。第一次冷卻預設為 45–90 分鐘；24 小時內再次命中時會乘 4，逐步延長到 3–6 小時、12–24 小時，最高 24 小時，且會遵守伺服器較長的 `Retry-After`。重啟 Worker 或按「立即重試」都不會跳過仍有效的全域冷卻；限流不會耗用工作本身的功能性重試次數，也不會把尚未完成的名單掃描標成正式失敗。
+
+可在 `.env` 調整：
+
+```dotenv
+RATE_LIMIT_INITIAL_MIN_DELAY_SECONDS=2700
+RATE_LIMIT_INITIAL_MAX_DELAY_SECONDS=5400
+RATE_LIMIT_BACKOFF_MULTIPLIER=4
+RATE_LIMIT_MAX_DELAY_SECONDS=86400
+RATE_LIMIT_STREAK_RESET_SECONDS=86400
+```
+
 ## 更新與回復
 
 ```bash

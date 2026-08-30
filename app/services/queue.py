@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import random
 from datetime import UTC, date, datetime, timedelta
+from typing import TypedDict
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,10 +12,160 @@ from app.config import Settings
 from app.models import Account, Content, Job, RuntimeState
 
 GLOBAL_NEXT_BATCH_KEY = "global-next-batch-at"
+GLOBAL_RATE_LIMIT_KEY = "global-rate-limit"
+GLOBAL_RATE_LIMIT_STATE_VERSION = 1
+
+
+class GlobalRateLimitState(TypedDict):
+    version: int
+    consecutive_hits: int
+    last_hit_at: datetime
+    cooldown_until: datetime
+    last_reason: str | None
 
 
 def now_utc() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _naive_utc(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+
+
+def _load_global_rate_limit_state(db: Session) -> GlobalRateLimitState | None:
+    row = db.get(RuntimeState, GLOBAL_RATE_LIMIT_KEY)
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row.value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != GLOBAL_RATE_LIMIT_STATE_VERSION:
+        return None
+
+    try:
+        consecutive_hits = int(payload["consecutive_hits"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    last_hit_at = _parse_datetime(payload.get("last_hit_at"))
+    cooldown_until = _parse_datetime(payload.get("cooldown_until"))
+    if consecutive_hits < 1 or last_hit_at is None or cooldown_until is None:
+        return None
+    last_reason = payload.get("last_reason")
+    return GlobalRateLimitState(
+        version=GLOBAL_RATE_LIMIT_STATE_VERSION,
+        consecutive_hits=consecutive_hits,
+        last_hit_at=last_hit_at,
+        cooldown_until=cooldown_until,
+        last_reason=last_reason if isinstance(last_reason, str) else None,
+    )
+
+
+def active_global_rate_limit(
+    db: Session, now: datetime | None = None
+) -> GlobalRateLimitState | None:
+    """Return the persisted global rate-limit state while its cooldown is active."""
+    state = _load_global_rate_limit_state(db)
+    current = _naive_utc(now) if now is not None else now_utc()
+    if state is None or state["cooldown_until"] <= current:
+        return None
+    return state
+
+
+def _store_runtime_state(db: Session, key: str, value: str) -> None:
+    row = db.get(RuntimeState, key)
+    if row is None:
+        db.add(RuntimeState(key=key, value=value))
+    else:
+        row.value = value
+
+
+def _defer_global_until(db: Session, deadline: datetime) -> datetime:
+    deadline = _naive_utc(deadline)
+    existing = global_next_batch_at(db)
+    effective = max(deadline, existing) if existing is not None else deadline
+    _store_runtime_state(db, GLOBAL_NEXT_BATCH_KEY, effective.isoformat())
+    return effective
+
+
+def _scaled_rate_limit_delay(settings: Settings, consecutive_hits: int) -> tuple[int, int]:
+    minimum = min(
+        settings.rate_limit_initial_min_delay_seconds,
+        settings.rate_limit_max_delay_seconds,
+    )
+    maximum = min(
+        settings.rate_limit_initial_max_delay_seconds,
+        settings.rate_limit_max_delay_seconds,
+    )
+    if settings.rate_limit_backoff_multiplier <= 1:
+        return minimum, maximum
+    remaining = max(consecutive_hits - 1, 0)
+    while remaining and (
+        minimum < settings.rate_limit_max_delay_seconds
+        or maximum < settings.rate_limit_max_delay_seconds
+    ):
+        minimum = min(
+            minimum * settings.rate_limit_backoff_multiplier,
+            settings.rate_limit_max_delay_seconds,
+        )
+        maximum = min(
+            maximum * settings.rate_limit_backoff_multiplier,
+            settings.rate_limit_max_delay_seconds,
+        )
+        remaining -= 1
+    return minimum, maximum
+
+
+def defer_for_rate_limit(
+    db: Session,
+    settings: Settings,
+    *,
+    retry_after_seconds: int | None = None,
+    reason: str | None = None,
+    now: datetime | None = None,
+) -> tuple[datetime, int]:
+    """Persist and return a global cooldown for a Threads rate-limit response."""
+    current = _naive_utc(now) if now is not None else now_utc()
+    previous = _load_global_rate_limit_state(db)
+    reset_after = timedelta(seconds=settings.rate_limit_streak_reset_seconds)
+    if previous is not None and current < previous["last_hit_at"] + reset_after:
+        consecutive_hits = previous["consecutive_hits"] + 1
+    else:
+        consecutive_hits = 1
+
+    minimum, maximum = _scaled_rate_limit_delay(settings, consecutive_hits)
+    policy_delay = random.randint(minimum, maximum)
+    retry_after = max(retry_after_seconds or 0, 0)
+    deadline = current + timedelta(seconds=max(policy_delay, retry_after))
+    if previous is not None:
+        deadline = max(deadline, previous["cooldown_until"])
+
+    payload = {
+        "version": GLOBAL_RATE_LIMIT_STATE_VERSION,
+        "consecutive_hits": consecutive_hits,
+        "last_hit_at": current.isoformat(),
+        "cooldown_until": deadline.isoformat(),
+        "last_reason": str(reason)[:1000] if reason is not None else None,
+    }
+    _store_runtime_state(
+        db,
+        GLOBAL_RATE_LIMIT_KEY,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+    )
+    _defer_global_until(db, deadline)
+    db.flush()
+    return deadline, consecutive_hits
 
 
 def enqueue_unique(
@@ -93,6 +245,8 @@ def schedule_content_refreshes(db: Session, settings: Settings, account_id: int)
 
 def schedule_due_accounts(db: Session, settings: Settings) -> int:
     now = now_utc()
+    if active_global_rate_limit(db, now) is not None:
+        return 0
     accounts = db.scalars(
         select(Account).where(
             Account.enabled.is_(True),
@@ -140,27 +294,25 @@ def global_next_batch_at(db: Session) -> datetime | None:
     state = db.get(RuntimeState, GLOBAL_NEXT_BATCH_KEY)
     if not state:
         return None
-    try:
-        return datetime.fromisoformat(state.value)
-    except ValueError:
-        return None
+    return _parse_datetime(state.value)
 
 
 def defer_global_next_batch(db: Session, settings: Settings, now: datetime) -> datetime:
-    next_at = now + timedelta(
+    current = _naive_utc(now)
+    next_at = current + timedelta(
         seconds=random.randint(settings.batch_min_delay_seconds, settings.batch_max_delay_seconds)
     )
-    state = db.get(RuntimeState, GLOBAL_NEXT_BATCH_KEY)
-    if state is None:
-        db.add(RuntimeState(key=GLOBAL_NEXT_BATCH_KEY, value=next_at.isoformat()))
-    else:
-        state.value = next_at.isoformat()
-    return next_at
+    rate_limit = active_global_rate_limit(db, current)
+    if rate_limit is not None:
+        next_at = max(next_at, rate_limit["cooldown_until"])
+    return _defer_global_until(db, next_at)
 
 
 def claim_next_job(db: Session, settings: Settings) -> Job | None:
     now = now_utc()
     if get_daily_batch_count(db, settings) >= settings.daily_batch_limit:
+        return None
+    if active_global_rate_limit(db, now) is not None:
         return None
     global_not_before = global_next_batch_at(db)
     if global_not_before and global_not_before > now:

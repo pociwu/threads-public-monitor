@@ -31,6 +31,7 @@ from app.services.collector import (
     ContentData,
     LoginRequired,
     ProfileData,
+    RateLimited,
     RelationshipBatch,
     RelationshipMemberData,
     TransientRelationshipError,
@@ -1113,6 +1114,94 @@ def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:
         assert scan.status == "failed"
         assert account.status == "active"
         assert account.status_message is None
+
+
+def test_rate_limited_relationship_job_is_preserved_without_counting_failure(
+    tmp_path,
+) -> None:
+    class RateLimitedRelationshipCollector(FakeCollector):
+        def collect_relationships(self, *_args, **_kwargs):
+            raise RateLimited(
+                "Threads 要求次數過多",
+                retry_after_seconds=3600,
+            )
+
+    now = datetime(2026, 8, 30, 1, 0)
+    retry_at = datetime(2026, 8, 30, 2, 0)
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        telegram_bot_token="secret-token",
+        telegram_chat_id="-100123",
+    )
+    with make_session() as db:
+        account = Account(
+            username="example",
+            status="active",
+            follower_count=51,
+            consecutive_failures=2,
+        )
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 30),
+            status="running",
+            cursor="saved_cursor",
+            collected_count=5,
+        )
+        job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="running",
+            attempts=1,
+            started_at=now,
+        )
+        db.add_all([scan, job])
+        db.commit()
+
+        with (
+            patch(
+                "app.services.processor.ThreadsCollector",
+                RateLimitedRelationshipCollector,
+            ),
+            patch(
+                "app.services.processor.defer_for_rate_limit",
+                return_value=(retry_at, 1),
+            ) as defer,
+            patch("app.services.processor.now_utc", return_value=now),
+        ):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        defer.assert_called_once_with(
+            db,
+            settings,
+            retry_after_seconds=3600,
+            reason="Threads 要求次數過多",
+        )
+        assert job.status == "queued"
+        assert job.attempts == 0
+        assert job.not_before == retry_at
+        assert job.started_at is None
+        assert job.finished_at is None
+        assert job.error == "Threads 要求次數過多"
+        assert scan.status == "running"
+        assert scan.cursor == "saved_cursor"
+        assert scan.collected_count == 5
+        assert scan.completed_at is None
+        assert account.status == "active"
+        assert account.consecutive_failures == 2
+        assert account.cooldown_until is None
+        assert account.last_attempt_at == now
+        assert db.scalar(select(NotificationOutbox)) is None
+        run = db.scalar(select(CollectionRun))
+        assert run is not None
+        assert run.status == "failed"
+        assert run.message == "Threads 要求次數過多"
 
 
 def test_transient_relationship_failure_requeues_same_job_after_long_backoff(

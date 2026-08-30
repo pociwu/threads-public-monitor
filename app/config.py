@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     relationship_max_attempts: int = Field(default=3, ge=1)
     relationship_retry_min_delay_seconds: int = Field(default=2700, ge=0)
     relationship_retry_max_delay_seconds: int = Field(default=5400, ge=0)
+    rate_limit_initial_min_delay_seconds: int = Field(default=2700, ge=1)
+    rate_limit_initial_max_delay_seconds: int = Field(default=5400, ge=1)
+    rate_limit_backoff_multiplier: int = Field(default=4, ge=1)
+    rate_limit_max_delay_seconds: int = Field(default=86400, ge=1)
+    rate_limit_streak_reset_seconds: int = Field(default=86400, ge=1)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_notification_timeout_seconds: int = Field(default=15, ge=1, le=60)
@@ -53,6 +58,21 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "relationship retry minimum delay must not exceed maximum delay"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_rate_limit_delay(self) -> Settings:
+        if (
+            self.rate_limit_initial_min_delay_seconds
+            > self.rate_limit_initial_max_delay_seconds
+        ):
+            raise ValueError(
+                "rate limit initial minimum delay must not exceed initial maximum delay"
+            )
+        if self.rate_limit_initial_max_delay_seconds > self.rate_limit_max_delay_seconds:
+            raise ValueError(
+                "rate limit initial maximum delay must not exceed maximum delay"
             )
         return self
 

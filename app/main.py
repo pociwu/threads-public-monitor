@@ -32,7 +32,12 @@ from app.models import (
 )
 from app.services.content_text import clean_content_text
 from app.services.media import media_usage_bytes, media_usage_percent
-from app.services.queue import enqueue_unique, now_utc, schedule_content_refreshes
+from app.services.queue import (
+    active_global_rate_limit,
+    enqueue_unique,
+    now_utc,
+    schedule_content_refreshes,
+)
 from app.services.usernames import InvalidUsername, normalize_username
 
 settings = get_settings()
@@ -166,6 +171,7 @@ def _stream_views(account: Account) -> list[dict]:
 def dashboard(request: Request, db: Session = Depends(get_db), error: str | None = None):
     usage = media_usage_bytes(db)
     usage_percent = media_usage_percent(db, settings)
+    rate_limit = active_global_rate_limit(db)
     login_required = bool(
         db.scalar(select(func.count(Account.id)).where(Account.status == "login_required"))
     )
@@ -181,6 +187,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), error: str | None
             "usage_bytes": usage,
             "usage_percent": usage_percent,
             "usage_gb": usage / 1024**3,
+            "rate_limit": rate_limit,
             "login_required": login_required,
             "error": error,
             "version": __version__,
@@ -247,8 +254,14 @@ def retry_account(account_id: int, db: Session = Depends(get_db)):
     account = db.get(Account, account_id)
     if not account or not account.enabled:
         raise HTTPException(404)
+    now = now_utc()
+    if active_global_rate_limit(db, now=now):
+        return RedirectResponse(
+            "/?error=Threads 全域冷卻中，立即重試不會解除冷卻",
+            status_code=303,
+        )
     account.cooldown_until = None
-    account.next_due_at = now_utc()
+    account.next_due_at = now
     account.status = "pending" if not account.last_success_at else "queued"
     account.status_message = None
     enqueue_unique(

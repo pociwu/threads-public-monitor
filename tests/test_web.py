@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -335,6 +336,84 @@ def test_retry_moves_login_required_account_back_to_pending() -> None:
         job = db.scalar(select(Job).where(Job.account_id == account.id))
         assert job is not None
         assert job.kind == "verify"
+        assert job.status == "queued"
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_dashboard_shows_global_rate_limit_and_retry_cannot_bypass_it() -> None:
+    client, db = make_client()
+    try:
+        original_due = datetime(2026, 9, 1, 1, 0)
+        account = Account(
+            username="example",
+            status="active",
+            last_success_at=datetime(2026, 8, 30, 1, 0),
+            next_due_at=original_due,
+        )
+        db.add(account)
+        db.commit()
+        rate_limit = {
+            "version": 1,
+            "consecutive_hits": 2,
+            "last_hit_at": datetime(2026, 8, 30, 2, 0),
+            "cooldown_until": datetime(2026, 8, 31, 2, 0),
+            "last_reason": "Threads 要求次數過多",
+        }
+
+        with patch("app.main.active_global_rate_limit", return_value=rate_limit):
+            page = client.get("/")
+            response = client.post(
+                f"/accounts/{account.id}/retry",
+                follow_redirects=False,
+            )
+
+        assert page.status_code == 200
+        assert "Threads 全域冷卻中" in page.text
+        assert "Threads 要求次數過多" in page.text
+        assert 'type="submit" disabled>全域冷卻中</button>' in page.text
+        assert response.status_code == 303
+        assert "error=" in response.headers["location"]
+        db.refresh(account)
+        assert account.status == "active"
+        assert account.next_due_at == original_due
+        assert db.scalar(select(Job).where(Job.account_id == account.id)) is None
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_retry_can_clear_account_cooldown_when_no_global_rate_limit() -> None:
+    client, db = make_client()
+    try:
+        cooldown_until = datetime(2099, 1, 1, 0, 0)
+        account = Account(
+            username="example",
+            status="cooldown",
+            status_message="連續失敗，等待冷卻",
+            last_success_at=datetime(2026, 8, 30, 1, 0),
+            next_due_at=cooldown_until,
+            cooldown_until=cooldown_until,
+        )
+        db.add(account)
+        db.commit()
+
+        page = client.get("/")
+        response = client.post(
+            f"/accounts/{account.id}/retry",
+            follow_redirects=False,
+        )
+
+        assert '>立即重試</button>' in page.text
+        assert response.status_code == 303
+        db.refresh(account)
+        assert account.status == "queued"
+        assert account.cooldown_until is None
+        assert account.next_due_at <= datetime.now()
+        job = db.scalar(select(Job).where(Job.account_id == account.id))
+        assert job is not None
+        assert job.kind == "profile"
         assert job.status == "queued"
     finally:
         app.dependency_overrides.clear()

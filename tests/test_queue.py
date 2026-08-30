@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -11,7 +12,10 @@ from app.config import Settings
 from app.db import Base
 from app.models import Account, Job, RuntimeState
 from app.services.queue import (
+    active_global_rate_limit,
     claim_next_job,
+    defer_for_rate_limit,
+    defer_global_next_batch,
     enqueue_unique,
     next_relationship_retry,
     now_utc,
@@ -91,6 +95,213 @@ def test_global_batch_gate_spaces_ready_jobs_across_accounts() -> None:
         assert datetime.fromisoformat(gate.value) >= first.started_at + timedelta(seconds=180)
 
 
+def test_persisted_global_rate_limit_blocks_scheduling_and_claiming() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+        rate_limit_initial_min_delay_seconds=2700,
+        rate_limit_initial_max_delay_seconds=2700,
+    )
+    fixed_now = datetime(2026, 8, 30, 1, 0)
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as db:
+        account = Account(
+            username="due",
+            status="active",
+            next_due_at=fixed_now - timedelta(minutes=1),
+        )
+        db.add(account)
+        db.flush()
+        account_id = account.id
+        deadline, hits = defer_for_rate_limit(
+            db,
+            settings,
+            reason="Threads HTTP 429",
+            now=fixed_now,
+        )
+        db.commit()
+
+    assert deadline == fixed_now + timedelta(minutes=45)
+    assert hits == 1
+
+    with Session(engine) as db:
+        active = active_global_rate_limit(db, fixed_now)
+        assert active is not None
+        assert active["consecutive_hits"] == 1
+        assert active["last_hit_at"] == fixed_now
+        assert active["cooldown_until"] == deadline
+        assert active["last_reason"] == "Threads HTTP 429"
+        persisted = db.get(RuntimeState, "global-rate-limit")
+        assert persisted is not None
+        payload = json.loads(persisted.value)
+        assert payload["cooldown_until"] == deadline.isoformat()
+        assert payload["consecutive_hits"] == 1
+
+        with patch("app.services.queue.now_utc", return_value=fixed_now):
+            assert schedule_due_accounts(db, settings) == 0
+        assert db.scalar(select(Job)) is None
+
+        enqueue_unique(db, kind="profile", account_id=account_id, priority=1)
+        db.commit()
+        with patch("app.services.queue.now_utc", return_value=fixed_now):
+            assert claim_next_job(db, settings) is None
+
+
+def test_global_rate_limit_backoff_multiplies_by_four_and_caps_at_one_day() -> None:
+    settings = Settings(database_url="sqlite:///:memory:")
+    first_at = datetime(2026, 8, 30, 1, 0)
+    second_at = first_at + timedelta(hours=2)
+    third_at = first_at + timedelta(hours=9)
+    with (
+        make_session() as db,
+        patch(
+            "app.services.queue.random.randint",
+            side_effect=lambda _minimum, maximum: maximum,
+        ) as randint,
+    ):
+        first_deadline, first_hits = defer_for_rate_limit(db, settings, now=first_at)
+        second_deadline, second_hits = defer_for_rate_limit(db, settings, now=second_at)
+        third_deadline, third_hits = defer_for_rate_limit(db, settings, now=third_at)
+
+    assert (first_hits, second_hits, third_hits) == (1, 2, 3)
+    assert first_deadline == first_at + timedelta(minutes=90)
+    assert second_deadline == second_at + timedelta(hours=6)
+    assert third_deadline == third_at + timedelta(hours=24)
+    assert [call.args for call in randint.call_args_list] == [
+        (2700, 5400),
+        (10800, 21600),
+        (43200, 86400),
+    ]
+
+
+def test_retry_after_is_honored_and_later_events_do_not_shorten_cooldown() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        rate_limit_initial_min_delay_seconds=2700,
+        rate_limit_initial_max_delay_seconds=2700,
+    )
+    fixed_now = datetime(2026, 8, 30, 1, 0)
+    with make_session() as db:
+        first_deadline, first_hits = defer_for_rate_limit(
+            db,
+            settings,
+            retry_after_seconds=36 * 60 * 60,
+            now=fixed_now,
+        )
+        second_deadline, second_hits = defer_for_rate_limit(
+            db,
+            settings,
+            now=fixed_now + timedelta(minutes=1),
+        )
+
+        normal_deadline = defer_global_next_batch(db, settings, fixed_now + timedelta(minutes=2))
+        gate = db.get(RuntimeState, "global-next-batch-at")
+
+    assert (first_hits, second_hits) == (1, 2)
+    assert first_deadline == fixed_now + timedelta(hours=36)
+    assert second_deadline == first_deadline
+    assert normal_deadline == first_deadline
+    assert gate is not None
+    assert datetime.fromisoformat(gate.value) == first_deadline
+
+
+def test_global_rate_limit_streak_resets_after_twenty_four_quiet_hours() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        rate_limit_initial_min_delay_seconds=2700,
+        rate_limit_initial_max_delay_seconds=2700,
+        rate_limit_streak_reset_seconds=86400,
+    )
+    fixed_now = datetime(2026, 8, 30, 1, 0)
+    with make_session() as db:
+        first_deadline, first_hits = defer_for_rate_limit(db, settings, now=fixed_now)
+        reset_at = fixed_now + timedelta(hours=24)
+        assert active_global_rate_limit(db, reset_at) is None
+        reset_deadline, reset_hits = defer_for_rate_limit(db, settings, now=reset_at)
+
+    assert first_hits == 1
+    assert first_deadline == fixed_now + timedelta(minutes=45)
+    assert reset_hits == 1
+    assert reset_deadline == reset_at + timedelta(minutes=45)
+
+
+def test_corrupt_global_rate_limit_state_does_not_crash_or_block_queue() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+        rate_limit_initial_min_delay_seconds=2700,
+        rate_limit_initial_max_delay_seconds=2700,
+    )
+    fixed_now = datetime(2026, 8, 30, 1, 0)
+    with make_session() as db:
+        account = Account(username="example", status="active")
+        db.add_all(
+            [
+                account,
+                RuntimeState(key="global-rate-limit", value="{not valid json"),
+            ]
+        )
+        db.flush()
+        enqueue_unique(
+            db,
+            kind="profile",
+            account_id=account.id,
+            not_before=fixed_now,
+        )
+
+        assert active_global_rate_limit(db, fixed_now) is None
+        with patch("app.services.queue.now_utc", return_value=fixed_now):
+            claimed = claim_next_job(db, settings)
+        assert claimed is not None
+
+        deadline, hits = defer_for_rate_limit(db, settings, now=fixed_now)
+        repaired = db.get(RuntimeState, "global-rate-limit")
+
+    assert deadline == fixed_now + timedelta(minutes=45)
+    assert hits == 1
+    assert repaired is not None
+    assert json.loads(repaired.value)["consecutive_hits"] == 1
+
+
+def test_rate_limit_multiplier_one_handles_a_large_persisted_streak() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        rate_limit_initial_min_delay_seconds=2700,
+        rate_limit_initial_max_delay_seconds=5400,
+        rate_limit_backoff_multiplier=1,
+    )
+    fixed_now = datetime(2026, 8, 30, 1, 0)
+    payload = {
+        "version": 1,
+        "consecutive_hits": 1_000_000_000,
+        "last_hit_at": (fixed_now - timedelta(minutes=1)).isoformat(),
+        "cooldown_until": fixed_now.isoformat(),
+        "last_reason": "previous",
+    }
+    with make_session() as db:
+        db.add(
+            RuntimeState(
+                key="global-rate-limit",
+                value=json.dumps(payload),
+            )
+        )
+        db.commit()
+        with patch("app.services.queue.random.randint", return_value=2700) as randint:
+            deadline, hits = defer_for_rate_limit(db, settings, now=fixed_now)
+
+    assert hits == 1_000_000_001
+    assert deadline == fixed_now + timedelta(minutes=45)
+    randint.assert_called_once_with(2700, 5400)
+
+
 def test_relationship_retry_delay_doubles_after_each_failed_attempt() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -152,5 +363,25 @@ def test_requeued_relationship_job_cannot_run_before_backoff() -> None:
     ],
 )
 def test_relationship_retry_settings_reject_unsafe_ranges(settings) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**settings)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"rate_limit_initial_min_delay_seconds": 0},
+        {"rate_limit_backoff_multiplier": 0},
+        {
+            "rate_limit_initial_min_delay_seconds": 5400,
+            "rate_limit_initial_max_delay_seconds": 2700,
+        },
+        {
+            "rate_limit_initial_max_delay_seconds": 90_000,
+            "rate_limit_max_delay_seconds": 86_400,
+        },
+    ],
+)
+def test_rate_limit_settings_reject_unsafe_ranges(settings) -> None:
     with pytest.raises(ValidationError):
         Settings(**settings)

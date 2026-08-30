@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -6,12 +7,35 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.config import Settings
 from app.services.collector import (
+    RateLimited,
+    RestrictedPage,
     ThreadsCollector,
     TransientRelationshipError,
     content_fingerprint,
     parse_count,
     parse_labeled_count,
+    parse_retry_after,
 )
+
+
+class FakeRequest:
+    def __init__(self, resource_type: str) -> None:
+        self.resource_type = resource_type
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        *,
+        status: int,
+        url: str = "https://www.threads.com/api/graphql",
+        resource_type: str = "xhr",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status = status
+        self.url = url
+        self.request = FakeRequest(resource_type)
+        self.headers = headers or {}
 
 
 @pytest.mark.parametrize(
@@ -33,6 +57,309 @@ def test_parse_labeled_count_falls_back_to_visible_profile_text() -> None:
     body = "顯示名稱\n1.2萬位粉絲\n個人簡介"
     assert parse_labeled_count(None, body, r"粉絲|followers?") == 12_000
     assert parse_labeled_count(None, body, r"追蹤中|following") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("invalid", None),
+        ("-1", None),
+        ("120", 120),
+        ("Sun, 30 Aug 2026 10:02:00 GMT", 120),
+        ("Sun, 30 Aug 2026 09:59:00 GMT", 0),
+    ],
+)
+def test_parse_retry_after_accepts_delta_seconds_and_http_dates(
+    value: str | None, expected: int | None
+) -> None:
+    assert (
+        parse_retry_after(value, now=datetime(2026, 8, 30, 10, 0, tzinfo=UTC))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.threads.com/api/graphql",
+        "https://www.threads.net/api/graphql",
+        "https://www.instagram.com/api/v1/example",
+        "https://www.facebook.com/api/graphql",
+    ],
+)
+def test_collector_records_429_from_meta_ui_requests(tmp_path, url: str) -> None:
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    collector._record_rate_limit_response(
+        FakeResponse(
+            status=429,
+            url=url,
+            resource_type="fetch",
+            headers={"retry-after": "900"},
+        )
+    )
+
+    with pytest.raises(RateLimited) as raised:
+        collector._raise_if_rate_limited()
+
+    assert raised.value.retry_after_seconds == 900
+    assert raised.value.source_url == url
+
+
+def test_collector_keeps_longest_retry_after_from_multiple_429_responses(tmp_path) -> None:
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    collector._record_rate_limit_response(
+        FakeResponse(status=429, headers={"Retry-After": "60"})
+    )
+    collector._record_rate_limit_response(
+        FakeResponse(status=429, headers={"retry-after": "1800"})
+    )
+
+    with pytest.raises(RateLimited) as raised:
+        collector._raise_if_rate_limited()
+
+    assert raised.value.retry_after_seconds == 1800
+
+
+@pytest.mark.parametrize("resource_type", ["image", "media", "font", "stylesheet"])
+def test_collector_ignores_429_from_media_resources(
+    tmp_path, resource_type: str
+) -> None:
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+
+    collector._record_rate_limit_response(
+        FakeResponse(status=429, resource_type=resource_type)
+    )
+
+    collector._raise_if_rate_limited()
+
+
+def test_collector_ignores_429_from_unrelated_hosts(tmp_path) -> None:
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+
+    collector._record_rate_limit_response(
+        FakeResponse(status=429, url="https://example.com/api", resource_type="xhr")
+    )
+
+    collector._raise_if_rate_limited()
+
+
+def test_page_closes_and_raises_rate_limited_for_navigation_429(tmp_path) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def goto(self, _url, *, wait_until, timeout):
+            assert wait_until == "domcontentloaded"
+            assert timeout == 60_000
+            return FakeResponse(
+                status=429,
+                url="https://www.threads.com/@example",
+                resource_type="document",
+                headers={"retry-after": "1800"},
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self):
+            return self.page
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    context = FakeContext()
+    collector._context = context
+
+    with pytest.raises(RateLimited) as raised:
+        collector._page("https://www.threads.com/@example")
+
+    assert raised.value.retry_after_seconds == 1800
+    assert context.page.closed is True
+
+
+@pytest.mark.parametrize(
+    ("body", "error_type"),
+    [
+        ("Too many requests. Try again later.", RateLimited),
+        ("Complete this captcha challenge", RestrictedPage),
+    ],
+)
+def test_page_classifies_visible_limit_pages_and_closes(
+    tmp_path, body: str, error_type: type[Exception]
+) -> None:
+    class FakePage:
+        url = "https://www.threads.com/@example"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def goto(self, _url, **_kwargs):
+            return FakeResponse(
+                status=200,
+                url=self.url,
+                resource_type="document",
+            )
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 1500
+
+        def locator(self, selector):
+            assert selector == "body"
+            return self
+
+        def inner_text(self, *, timeout):
+            assert timeout == 15_000
+            return body
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self):
+            return self.page
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    context = FakeContext()
+    collector._context = context
+
+    with pytest.raises(error_type):
+        collector._page(context.page.url)
+
+    assert context.page.closed is True
+
+
+def test_page_does_not_treat_rate_limit_words_in_long_post_body_as_limit_page(
+    tmp_path,
+) -> None:
+    class FakePage:
+        url = "https://www.threads.com/@example"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def goto(self, _url, **_kwargs):
+            return FakeResponse(
+                status=200,
+                url=self.url,
+                resource_type="document",
+            )
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+        def locator(self, _selector):
+            return self
+
+        def inner_text(self, **_kwargs):
+            return f"{'一般貼文內容' * 500}\ntry again later"
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self):
+            return self.page
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    context = FakeContext()
+    collector._context = context
+
+    page = collector._page(context.page.url)
+
+    assert page is context.page
+    assert context.page.closed is False
+
+
+def test_content_collection_stops_scrolling_after_xhr_429(tmp_path) -> None:
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+
+    class FakeMouse:
+        def __init__(self) -> None:
+            self.wheels = 0
+
+        def wheel(self, _x, _y):
+            self.wheels += 1
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.mouse = FakeMouse()
+            self.closed = False
+            self.waits = 0
+
+        def wait_for_timeout(self, milliseconds):
+            assert milliseconds == 800
+            self.waits += 1
+            collector._record_rate_limit_response(
+                FakeResponse(
+                    status=429,
+                    resource_type="xhr",
+                    headers={"retry-after": "600"},
+                )
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    page = FakePage()
+    collector._page = lambda _url: page
+
+    with pytest.raises(RateLimited) as raised:
+        collector.collect_content("example", "post")
+
+    assert raised.value.retry_after_seconds == 600
+    assert page.mouse.wheels == 1
+    assert page.waits == 1
+    assert page.closed is True
 
 
 def test_content_fingerprint_is_order_independent_for_media() -> None:
@@ -264,7 +591,42 @@ def test_relationship_row_wait_stops_after_two_passive_timeouts(tmp_path) -> Non
     assert page.waits == [2_500]
 
 
-def test_relationship_control_retries_until_threads_renders_it() -> None:
+def test_relationship_row_timeout_preserves_detected_rate_limit(tmp_path) -> None:
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, *, state, timeout):
+            assert state == "attached"
+            assert timeout == 30_000
+            collector._record_rate_limit_response(
+                FakeResponse(
+                    status=429,
+                    resource_type="xhr",
+                    headers={"retry-after": "3600"},
+                )
+            )
+            raise PlaywrightTimeoutError("Threads did not render the list")
+
+    class FakePage:
+        def locator(self, _selector):
+            return FakeLocator()
+
+    with pytest.raises(RateLimited) as raised:
+        collector._wait_for_relationship_rows(FakePage(), expected_count=51)
+
+    assert raised.value.retry_after_seconds == 3600
+
+
+def test_relationship_control_retries_until_threads_renders_it(tmp_path) -> None:
     class FakePage:
         def __init__(self):
             self.results = iter([False, False, True])
@@ -276,9 +638,15 @@ def test_relationship_control_retries_until_threads_renders_it() -> None:
         def wait_for_timeout(self, milliseconds):
             self.waits.append(milliseconds)
 
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
     page = FakePage()
 
-    assert ThreadsCollector._click_when_available(page, "script", attempts=60) is True
+    assert collector._click_when_available(page, "script", attempts=60) is True
     assert page.waits == [500, 500]
 
 
@@ -447,6 +815,67 @@ def test_interaction_counts_do_not_treat_post_prose_as_a_metric_summary() -> Non
         "repost_count": None,
         "share_count": None,
     }
+
+
+def test_collector_registers_browser_context_429_observer(monkeypatch, tmp_path) -> None:
+    class FakeContext:
+        def __init__(self) -> None:
+            self.response_handler = None
+            self.closed = False
+
+        def on(self, event, handler) -> None:
+            assert event == "response"
+            self.response_handler = handler
+
+        def close(self) -> None:
+            self.closed = True
+
+    context = FakeContext()
+
+    class FakeChromium:
+        def launch_persistent_context(self, *_args, **_kwargs):
+            return context
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    runtime = FakePlaywright()
+
+    class FakeManager:
+        def start(self):
+            return runtime
+
+    monkeypatch.setattr("app.services.collector.sync_playwright", FakeManager)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+            chromium_executable="missing",
+        )
+    )
+
+    with collector:
+        assert context.response_handler is not None
+        context.response_handler(
+            FakeResponse(
+                status=429,
+                url="https://www.facebook.com/api/graphql",
+                resource_type="fetch",
+                headers={"Retry-After": "300"},
+            )
+        )
+        with pytest.raises(RateLimited) as raised:
+            collector._raise_if_rate_limited()
+        assert raised.value.retry_after_seconds == 300
+
+    assert context.closed is True
+    assert runtime.stopped is True
 
 
 def test_collector_stops_playwright_when_browser_launch_fails(monkeypatch, tmp_path) -> None:

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from playwright.sync_api import BrowserContext, Locator, Page, sync_playwright
+from playwright.sync_api import BrowserContext, Locator, Page, Response, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.config import Settings
@@ -19,6 +23,8 @@ POST_ID_RE = re.compile(r"/post/([^/?#]+)")
 ACTIVE_RELATIONSHIP_DIALOG_SELECTOR = (
     '[role="dialog"]:visible, [aria-modal="true"]:visible'
 )
+RATE_LIMIT_RESOURCE_TYPES = frozenset({"document", "xhr", "fetch"})
+META_UI_HOST_SUFFIXES = ("threads.com", "threads.net", "instagram.com", "facebook.com")
 
 
 class CollectionError(RuntimeError):
@@ -31,6 +37,19 @@ class LoginRequired(CollectionError):
 
 class RestrictedPage(CollectionError):
     pass
+
+
+class RateLimited(RestrictedPage):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: int | None = None,
+        source_url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.source_url = source_url
 
 
 class TransientRelationshipError(CollectionError):
@@ -109,6 +128,31 @@ def parse_labeled_count(
     return None
 
 
+def parse_retry_after(
+    value: str | None, *, now: datetime | None = None
+) -> int | None:
+    """Parse an HTTP Retry-After delta or date into a non-negative delay."""
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.isdecimal():
+        return int(raw)
+    try:
+        retry_at = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at is None:
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    return max(0, math.ceil((retry_at - reference).total_seconds()))
+
+
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -123,8 +167,12 @@ class ThreadsCollector:
         self.settings = settings
         self._playwright = None
         self._context: BrowserContext | None = None
+        self._rate_limit_url: str | None = None
+        self._rate_limit_retry_after_seconds: int | None = None
 
     def __enter__(self) -> ThreadsCollector:
+        self._rate_limit_url = None
+        self._rate_limit_retry_after_seconds = None
         self._playwright = sync_playwright().start()
         executable = Path(self.settings.chromium_executable)
         try:
@@ -137,6 +185,7 @@ class ThreadsCollector:
                 viewport={"width": 1280, "height": 1200},
                 args=["--disable-dev-shm-usage", "--no-sandbox"],
             )
+            self._context.on("response", self._record_rate_limit_response)
         except BaseException:
             self._playwright.stop()
             self._playwright = None
@@ -152,19 +201,93 @@ class ThreadsCollector:
     def _page(self, url: str) -> Page:
         if not self._context:
             raise RuntimeError("Collector context is not open")
+        self._raise_if_rate_limited()
         page = self._context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(1500)
-        current = page.url.lower()
-        text = page.locator("body").inner_text(timeout=15_000).lower()
-        if "/login" in current or "登入以查看更多" in text or "log in to see" in text:
-            page.close()
-            raise LoginRequired("Threads 登入工作階段已失效")
-        restriction_markers = ["請稍後再試", "try again later", "challenge", "captcha"]
-        if any(marker in text for marker in restriction_markers):
-            page.close()
-            raise RestrictedPage("Threads 顯示限制或驗證頁")
-        return page
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            if response is not None:
+                self._record_rate_limit_response(response)
+            self._raise_if_rate_limited()
+            page.wait_for_timeout(1500)
+            self._raise_if_rate_limited()
+            current = page.url.lower()
+            text = page.locator("body").inner_text(timeout=15_000).lower()
+            self._raise_if_rate_limited()
+            if "/login" in current or "登入以查看更多" in text or "log in to see" in text:
+                raise LoginRequired("Threads 登入工作階段已失效")
+            rate_limit_markers = [
+                "請稍後再試",
+                "try again later",
+                "too many requests",
+                "rate limit",
+                "please wait a few minutes",
+            ]
+            if len(text) <= 2_000 and any(marker in text for marker in rate_limit_markers):
+                raise RateLimited(
+                    "Threads 顯示要求稍後再試，已停止本次擷取",
+                    source_url=page.url,
+                )
+            restriction_markers = ["challenge", "captcha"]
+            if any(marker in text for marker in restriction_markers):
+                raise RestrictedPage("Threads 顯示限制或驗證頁")
+            return page
+        except BaseException:
+            try:
+                self._raise_if_rate_limited()
+            finally:
+                with suppress(Exception):
+                    page.close()
+            raise
+
+    @staticmethod
+    def _is_meta_ui_host(url: str) -> bool:
+        try:
+            hostname = (urlparse(url).hostname or "").casefold()
+        except ValueError:
+            return False
+        return any(
+            hostname == suffix or hostname.endswith(f".{suffix}")
+            for suffix in META_UI_HOST_SUFFIXES
+        )
+
+    def _record_rate_limit_response(self, response: Response) -> None:
+        """Remember relevant 429 details without raising inside an event callback."""
+        try:
+            if response.status != 429:
+                return
+            if response.request.resource_type.casefold() not in RATE_LIMIT_RESOURCE_TYPES:
+                return
+            if not self._is_meta_ui_host(response.url):
+                return
+        except (AttributeError, TypeError, ValueError):
+            return
+        if self._rate_limit_url is None:
+            self._rate_limit_url = response.url
+        retry_after = None
+        with suppress(AttributeError, TypeError, ValueError):
+            retry_after_header = next(
+                (
+                    value
+                    for name, value in response.headers.items()
+                    if name.casefold() == "retry-after"
+                ),
+                None,
+            )
+            retry_after = parse_retry_after(retry_after_header)
+        if retry_after is not None:
+            self._rate_limit_retry_after_seconds = max(
+                retry_after,
+                self._rate_limit_retry_after_seconds or 0,
+            )
+
+    def _raise_if_rate_limited(self) -> None:
+        if self._rate_limit_url is None:
+            return
+        raise RateLimited(
+            "Threads 回應 HTTP 429，已停止本次擷取",
+            retry_after_seconds=self._rate_limit_retry_after_seconds,
+            source_url=self._rate_limit_url,
+        )
 
     def collect_profile(self, username: str) -> ProfileData:
         page = self._page(f"https://www.threads.com/@{username}")
@@ -226,6 +349,7 @@ class ThreadsCollector:
                 }""",
                 username,
             )
+            self._raise_if_rate_limited()
             body = raw.get("body", "")
             profile_source = f"{body}\n{raw.get('ogDescription') or ''}"
             if "找不到此頁面" in body or "page isn't available" in body.lower():
@@ -307,8 +431,10 @@ class ThreadsCollector:
         page = self._page(f"https://www.threads.com/@{username}{suffix}")
         try:
             for _ in range(8):
+                self._raise_if_rate_limited()
                 page.mouse.wheel(0, 900)
                 page.wait_for_timeout(800)
+                self._raise_if_rate_limited()
                 if cursor and page.locator(f'a[href*="/post/{cursor}"]').count():
                     break
             return self._content_items_from_page(
@@ -334,6 +460,7 @@ class ThreadsCollector:
         page = self._page(source_url)
         try:
             page.wait_for_timeout(1200)
+            self._raise_if_rate_limited()
             items = self._content_items_from_page(
                 page,
                 username,
@@ -416,6 +543,7 @@ class ThreadsCollector:
                 }""",
             {"username": username, "limit": limit, "targetId": target_id},
         )
+        self._raise_if_rate_limited()
         if cursor:
             cursor_index = next(
                 (index for index, raw in enumerate(raw_items) if raw.get("id") == cursor), -1
@@ -488,6 +616,7 @@ class ThreadsCollector:
             )
             if opened and relationship_type == "following":
                 page.wait_for_timeout(800)
+                self._raise_if_rate_limited()
                 opened = self._click_when_available(
                     page,
                     r"""() => {
@@ -518,10 +647,13 @@ class ThreadsCollector:
                     "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
                 )
             page.wait_for_timeout(1000)
+            self._raise_if_rate_limited()
             dialog = self._active_relationship_dialog(page)
             try:
                 dialog.wait_for(state="visible", timeout=10_000)
+                self._raise_if_rate_limited()
             except PlaywrightTimeoutError as exc:
+                self._raise_if_rate_limited()
                 self._save_relationship_diagnostic(page, username, relationship_type)
                 raise TransientRelationshipError(
                     self._relationship_timeout_message(relationship_type)
@@ -539,6 +671,7 @@ class ThreadsCollector:
                   };
                 }"""
             )
+            self._raise_if_rate_limited()
             effective_expected_count = self._effective_relationship_count(
                 relationship_type, relationship_counts, expected_count
             )
@@ -671,6 +804,7 @@ class ThreadsCollector:
                     "seenUsernames": sorted(seen_usernames or set()),
                 },
             )
+            self._raise_if_rate_limited()
             if not raw.get("available", True):
                 raise CollectionError("Threads 名單視窗未成功開啟")
             if not raw.get("members"):
@@ -704,13 +838,16 @@ class ThreadsCollector:
             and int(raw.get("orderedCount") or 0) > 0
         )
 
-    @staticmethod
-    def _click_when_available(page: Page, script: str, attempts: int = 60) -> bool:
+    def _click_when_available(self, page: Page, script: str, attempts: int = 60) -> bool:
         for attempt in range(attempts):
+            self._raise_if_rate_limited()
             if page.evaluate(script):
+                self._raise_if_rate_limited()
                 return True
+            self._raise_if_rate_limited()
             if attempt < attempts - 1:
                 page.wait_for_timeout(500)
+                self._raise_if_rate_limited()
         return False
 
     @staticmethod
@@ -733,8 +870,9 @@ class ThreadsCollector:
         current = parse_count(relationship_counts.get(relationship_type))
         return current if current is not None else fallback
 
-    @staticmethod
-    def _wait_for_relationship_rows(page: Page, expected_count: int | None) -> None:
+    def _wait_for_relationship_rows(
+        self, page: Page, expected_count: int | None
+    ) -> None:
         if expected_count is not None and expected_count <= 0:
             return
         rows = page.locator(
@@ -742,15 +880,19 @@ class ThreadsCollector:
             '[aria-modal="true"]:visible a[href*="/@"]'
         ).first
         for attempt, timeout in enumerate((30_000, 20_000)):
+            self._raise_if_rate_limited()
             try:
                 rows.wait_for(state="attached", timeout=timeout)
+                self._raise_if_rate_limited()
                 return
             except PlaywrightTimeoutError:
+                self._raise_if_rate_limited()
                 if attempt == 1:
                     raise
                 # Threads sometimes paints an empty dialog shell before its rows.
                 # A passive pause and second observation adds no click or page reload.
                 page.wait_for_timeout(2_500)
+                self._raise_if_rate_limited()
 
     def _save_relationship_diagnostic(
         self, page: Page, username: str, relationship_type: str

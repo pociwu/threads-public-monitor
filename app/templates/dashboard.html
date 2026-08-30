@@ -32,6 +32,9 @@
 </div>
 
 <div id="account-grid-region" data-refresh-interval="5000">
+{% if rate_limit %}
+<div class="alert warning"><strong>Threads 全域冷卻中。</strong> 為避免持續觸發要求次數限制，所有擷取暫停至 {{ rate_limit.cooldown_until|localtime }}。{% if rate_limit.last_reason %}<br>{{ rate_limit.last_reason }}{% endif %}</div>
+{% endif %}
 {% if cards %}
 <section id="account-grid" class="card-grid" data-reorder-url="/accounts/reorder">
   {% for item in cards %}{% set account = item.account %}
@@ -60,7 +63,7 @@
       {% if account.status_message %}<p class="status-message">{{ account.status_message }}</p>{% endif %}
     </a>
     <div class="card-actions">
-      <form method="post" action="/accounts/{{ account.id }}/retry"><button class="button ghost" type="submit">立即重試</button></form>
+      <form method="post" action="/accounts/{{ account.id }}/retry"><button class="button ghost" type="submit" {{ 'disabled' if rate_limit else '' }}>{{ '全域冷卻中' if rate_limit else '立即重試' }}</button></form>
       <form method="post" action="/accounts/{{ account.id }}/stop" data-confirm="停止監看 @{{ account.username }}？歷史資料會保留。"><button class="button ghost" type="submit">停止監看</button></form>
     </div>
   </article>
