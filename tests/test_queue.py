@@ -10,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
 from app.db import Base
-from app.models import Account, Job, RuntimeState
+from app.models import Account, CollectionRun, Job, RuntimeState
 from app.services.queue import (
     active_global_rate_limit,
     claim_next_job,
@@ -19,6 +19,7 @@ from app.services.queue import (
     enqueue_unique,
     next_relationship_retry,
     now_utc,
+    recover_interrupted_jobs,
     schedule_due_accounts,
 )
 
@@ -349,6 +350,69 @@ def test_requeued_relationship_job_cannot_run_before_backoff() -> None:
         assert claimed is not None
         assert claimed.id == job.id
         assert claimed.attempts == 2
+
+
+def test_recover_interrupted_jobs_requeues_jobs_and_closes_running_runs() -> None:
+    interrupted_at = datetime(2026, 9, 6, 2, 30)
+    original_started_at = interrupted_at - timedelta(minutes=12)
+    with make_session() as db:
+        account = Account(username="interrupted", status="active")
+        db.add(account)
+        db.flush()
+        job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="running",
+            attempts=2,
+            not_before=original_started_at,
+            started_at=original_started_at,
+        )
+        run = CollectionRun(
+            account_id=account.id,
+            job_kind="relationship",
+            content_type="followers",
+            status="running",
+            started_at=original_started_at,
+        )
+        finished_run = CollectionRun(
+            account_id=account.id,
+            job_kind="profile",
+            status="succeeded",
+            started_at=original_started_at,
+            finished_at=original_started_at + timedelta(minutes=1),
+        )
+        db.add_all([job, run, finished_run])
+        db.commit()
+
+        recovered = recover_interrupted_jobs(db, now=interrupted_at)
+        db.commit()
+
+        assert recovered == 1
+        assert job.status == "queued"
+        assert job.attempts == 1
+        assert job.not_before == interrupted_at
+        assert job.started_at is None
+        assert job.finished_at is None
+        assert job.error == "Worker 重新啟動，已回收中斷工作並重新排隊"
+        assert run.status == "failed"
+        assert run.finished_at == interrupted_at
+        assert run.message == "Worker 重新啟動，工作執行中斷"
+        assert finished_run.status == "succeeded"
+        assert finished_run.finished_at == original_started_at + timedelta(minutes=1)
+
+
+def test_recover_interrupted_jobs_is_idempotent() -> None:
+    interrupted_at = datetime(2026, 9, 6, 2, 30)
+    with make_session() as db:
+        db.add(Job(kind="profile", status="running", attempts=1, started_at=interrupted_at))
+        db.commit()
+
+        assert recover_interrupted_jobs(db, now=interrupted_at) == 1
+        db.commit()
+        recovered_job = db.scalar(select(Job))
+        assert recovered_job.attempts == 0
+        assert recover_interrupted_jobs(db, now=interrupted_at + timedelta(minutes=1)) == 0
 
 
 @pytest.mark.parametrize(

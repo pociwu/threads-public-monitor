@@ -690,10 +690,58 @@ def test_missing_relationship_control_is_retryable_and_saves_diagnostic(tmp_path
     assert page.closed is True
 
 
-def test_accessible_relationship_end_can_complete_below_profile_count() -> None:
+def test_relationship_dialog_rerender_is_retryable_and_saves_diagnostic(tmp_path) -> None:
+    class FakeDialog:
+        def wait_for(self, *, state, timeout):
+            assert state == "visible"
+            assert timeout == 10_000
+
+        def evaluate(self, _script):
+            return {"followers": "粉絲 51", "following": "追蹤中 149"}
+
+    class FakePage:
+        def __init__(self):
+            self.closed = False
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    page = FakePage()
+    dialog = FakeDialog()
+    diagnostics = []
+    collector._page = lambda _url: page
+    collector._click_when_available = lambda *_args, **_kwargs: True
+    collector._active_relationship_dialog = lambda _page: dialog
+    collector._wait_for_relationship_rows = lambda *_args, **_kwargs: None
+    collector._scan_relationship_dialog = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PlaywrightTimeoutError("dialog was detached during rerender")
+    )
+    collector._save_relationship_diagnostic = (
+        lambda _page, username, relationship_type: diagnostics.append(
+            (username, relationship_type)
+        )
+    )
+
+    with pytest.raises(TransientRelationshipError, match="掃描中斷"):
+        collector.collect_relationships("example", "followers")
+
+    assert diagnostics == [("example", "followers")]
+    assert page.closed is True
+
+
+def test_relationship_batch_only_completes_on_explicit_scanner_decision() -> None:
     assert ThreadsCollector._relationship_batch_complete(
         {
-            "complete": False,
+            "complete": True,
             "atEnd": True,
             "stagnant": 8,
             "orderedCount": 122,
@@ -703,10 +751,441 @@ def test_accessible_relationship_end_can_complete_below_profile_count() -> None:
         {
             "complete": False,
             "atEnd": True,
-            "stagnant": 2,
+            "stagnant": 8,
             "orderedCount": 122,
         }
     ) is False
+
+
+def test_relationship_dialog_accumulates_virtualized_rows_across_scrolls(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeDialog:
+        def __init__(self):
+            self.snapshots = iter(
+                [
+                    {
+                        "members": [
+                            {"username": "alice", "displayName": "Alice", "avatarUrl": None},
+                            {"username": "bob", "displayName": "Bob", "avatarUrl": None},
+                        ],
+                        "atEnd": False,
+                        "scrollTop": 0,
+                        "scrollHeight": 1000,
+                        "clientHeight": 400,
+                        "moved": True,
+                    },
+                    {
+                        "members": [
+                            {"username": "bob", "displayName": "Bob", "avatarUrl": None},
+                            {"username": "carol", "displayName": "Carol", "avatarUrl": None},
+                            {"username": "dave", "displayName": "Dave", "avatarUrl": None},
+                        ],
+                        "atEnd": False,
+                        "scrollTop": 320,
+                        "scrollHeight": 1200,
+                        "clientHeight": 400,
+                        "moved": True,
+                    },
+                ]
+            )
+            self.calls = 0
+
+        def evaluate(self, _script, _payload):
+            self.calls += 1
+            return next(self.snapshots)
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr("app.services.collector.random.randint", lambda *_args: 800)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    dialog = FakeDialog()
+    page = FakePage()
+
+    raw = collector._scan_relationship_dialog(
+        page,
+        dialog,
+        owner="example",
+        limit=3,
+        cursor=None,
+        expected_count=10,
+        seen_usernames=set(),
+    )
+
+    assert [member["username"] for member in raw["members"]] == ["alice", "bob", "carol"]
+    assert raw["complete"] is False
+    assert dialog.calls == 2
+    assert page.waits == [800]
+
+
+def test_exact_relationship_batch_size_can_complete_without_extra_job(
+    tmp_path, monkeypatch
+) -> None:
+    members = [
+        {
+            "username": f"member_{index}",
+            "displayName": f"Member {index}",
+            "avatarUrl": None,
+        }
+        for index in range(25)
+    ]
+
+    class FakeDialog:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, script, _payload):
+            self.calls += 1
+            assert '[role="alert"]' in script
+            assert '[aria-modal="true"]' in script
+            return {
+                "members": members,
+                "atEnd": True,
+                "scrollable": True,
+                "scrollTop": 600,
+                "scrollHeight": 1_000,
+                "clientHeight": 400,
+                "moved": False,
+            }
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr("app.services.collector.random.randint", lambda *_args: 1_000)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    dialog = FakeDialog()
+    page = FakePage()
+
+    raw = collector._scan_relationship_dialog(
+        page,
+        dialog,
+        owner="example",
+        limit=25,
+        cursor=None,
+        expected_count=25,
+        seen_usernames=set(),
+    )
+
+    assert raw["complete"] is True
+    assert raw["terminationReason"] == "accessible_end"
+    assert len(raw["members"]) == 25
+    assert raw["observedUsernames"] == [member["username"] for member in members]
+
+
+def test_relationship_batch_overflow_stays_incomplete(tmp_path) -> None:
+    members = [
+        {"username": f"member_{index}", "displayName": None, "avatarUrl": None}
+        for index in range(26)
+    ]
+
+    class FakeDialog:
+        def evaluate(self, _script, _payload):
+            return {
+                "members": members,
+                "atEnd": True,
+                "scrollable": True,
+                "scrollTop": 600,
+                "scrollHeight": 1_000,
+                "clientHeight": 400,
+                "moved": False,
+            }
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    page = FakePage()
+
+    raw = collector._scan_relationship_dialog(
+        page,
+        FakeDialog(),
+        owner="example",
+        limit=25,
+        cursor=None,
+        expected_count=26,
+        seen_usernames=set(),
+    )
+
+    assert raw["complete"] is False
+    assert raw["terminationReason"] == "batch_limit"
+    assert len(raw["members"]) == 25
+    assert page.waits == []
+
+
+def test_relationship_dialog_waits_for_stable_accessible_end_below_profile_count(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeDialog:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, _script, _payload):
+            self.calls += 1
+            return {
+                "members": [
+                    {"username": "alice", "displayName": "Alice", "avatarUrl": None},
+                    {"username": "bob", "displayName": "Bob", "avatarUrl": None},
+                ],
+                "atEnd": True,
+                "scrollTop": 600,
+                "scrollHeight": 1000,
+                "clientHeight": 400,
+                "moved": False,
+            }
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr("app.services.collector.random.randint", lambda *_args: 1000)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    dialog = FakeDialog()
+    page = FakePage()
+
+    raw = collector._scan_relationship_dialog(
+        page,
+        dialog,
+        owner="example",
+        limit=25,
+        cursor=None,
+        expected_count=51,
+        seen_usernames=set(),
+    )
+
+    assert raw["complete"] is True
+    assert raw["terminationReason"] == "accessible_end"
+    assert sum(page.waits) >= 8_000
+    assert len(raw["members"]) == 2
+
+
+def test_relationship_dialog_stops_before_another_scroll_after_429(tmp_path) -> None:
+    class FakeDialog:
+        def __init__(self, collector):
+            self.collector = collector
+            self.calls = 0
+
+        def evaluate(self, _script, _payload):
+            self.calls += 1
+            self.collector._rate_limit_url = "https://www.threads.com/api/graphql"
+            return {
+                "members": [],
+                "atEnd": False,
+                "scrollTop": 0,
+                "scrollHeight": 1000,
+                "clientHeight": 400,
+                "moved": True,
+            }
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    dialog = FakeDialog(collector)
+    page = FakePage()
+
+    with pytest.raises(RateLimited):
+        collector._scan_relationship_dialog(
+            page,
+            dialog,
+            owner="example",
+            limit=25,
+            cursor=None,
+            expected_count=51,
+            seen_usernames=set(),
+        )
+
+    assert dialog.calls == 1
+    assert page.waits == []
+
+
+def test_relationship_dialog_stops_on_in_page_rate_limit_message(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeDialog:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, _script, _payload):
+            self.calls += 1
+            return {
+                "members": [],
+                "rateLimited": True,
+                "atEnd": False,
+                "scrollable": False,
+                "scrollTop": 0,
+                "scrollHeight": 0,
+                "clientHeight": 0,
+                "moved": False,
+            }
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr("app.services.collector.RELATIONSHIP_MAX_SCROLL_TURNS", 1)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    dialog = FakeDialog()
+    page = FakePage()
+
+    with pytest.raises(RateLimited, match="稍後再試"):
+        collector._scan_relationship_dialog(
+            page,
+            dialog,
+            owner="example",
+            limit=25,
+            cursor=None,
+            expected_count=51,
+            seen_usernames=set(),
+        )
+
+    assert dialog.calls == 1
+    assert page.waits == []
+
+
+def test_non_scrollable_truncated_relationship_dialog_does_not_complete_early(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeDialog:
+        def evaluate(self, _script, _payload):
+            return {
+                "members": [
+                    {"username": "alice", "displayName": "Alice", "avatarUrl": None},
+                ],
+                "atEnd": True,
+                "scrollable": False,
+                "scrollTop": 0,
+                "scrollHeight": 400,
+                "clientHeight": 400,
+                "moved": False,
+            }
+
+    class FakePage:
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    monkeypatch.setattr("app.services.collector.RELATIONSHIP_MAX_SCROLL_TURNS", 3)
+    monkeypatch.setattr("app.services.collector.random.randint", lambda *_args: 1_000)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+
+    raw = collector._scan_relationship_dialog(
+        FakePage(),
+        FakeDialog(),
+        owner="example",
+        limit=25,
+        cursor=None,
+        expected_count=51,
+        seen_usernames=set(),
+    )
+
+    assert raw["complete"] is False
+    assert raw["terminationReason"] == "turn_limit"
+    assert ThreadsCollector._relationship_batch_complete(raw) is False
+
+
+def test_non_scrollable_accessible_relationship_end_completes_after_extended_stability(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeDialog:
+        def evaluate(self, _script, _payload):
+            return {
+                "members": [
+                    {"username": "alice", "displayName": "Alice", "avatarUrl": None},
+                ],
+                "atEnd": True,
+                "scrollable": False,
+                "scrollTop": 0,
+                "scrollHeight": 400,
+                "clientHeight": 400,
+                "moved": False,
+            }
+
+    class FakePage:
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    monkeypatch.setattr("app.services.collector.random.randint", lambda *_args: 1_000)
+    collector = ThreadsCollector(
+        Settings(
+            media_root=tmp_path / "media",
+            browser_profile_dir=tmp_path / "profile",
+        )
+    )
+    page = FakePage()
+
+    raw = collector._scan_relationship_dialog(
+        page,
+        FakeDialog(),
+        owner="example",
+        limit=25,
+        cursor=None,
+        expected_count=51,
+        seen_usernames=set(),
+    )
+
+    assert raw["complete"] is True
+    assert raw["terminationReason"] == "accessible_end"
+    assert raw["stableEndMs"] >= 20_000
 
 
 def test_content_text_excludes_trailing_threads_ui_numbers() -> None:

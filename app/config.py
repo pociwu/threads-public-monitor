@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     schedule_jitter_minutes: int = 30
     batch_size: int = 10
     backfill_limit: int = 100
-    relationship_batch_size: int = 5
+    relationship_batch_size: int = 25
     relationship_max_attempts: int = Field(default=3, ge=1)
     relationship_retry_min_delay_seconds: int = Field(default=2700, ge=0)
     relationship_retry_max_delay_seconds: int = Field(default=5400, ge=0)
@@ -83,6 +83,17 @@ class Settings(BaseSettings):
     @property
     def telegram_notifications_enabled(self) -> bool:
         return bool(self.telegram_bot_token.strip() and self.telegram_chat_id.strip())
+
+    @property
+    def effective_relationship_batch_size(self) -> int:
+        """Clamp checkpoints to a range that limits both rescans and long bursts."""
+        return min(50, max(25, self.relationship_batch_size))
+
+    def relationship_batch_size_for(self, expected_count: int | None) -> int:
+        """Use larger checkpoints for long lists to reduce repeated top rescans."""
+        if expected_count is not None and expected_count >= 200:
+            return 50
+        return self.effective_relationship_batch_size
 
     def ensure_directories(self) -> None:
         self.media_root.mkdir(parents=True, exist_ok=True)

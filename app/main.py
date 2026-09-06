@@ -707,7 +707,9 @@ def account_detail(
             "relationship_scan": relationship_scan,
             "relationship_issue_job": relationship_issue_job,
             "relationship_changes": relationship_changes,
-            "relationship_batch_size": settings.relationship_batch_size,
+            "relationship_batch_size": settings.relationship_batch_size_for(
+                account.follower_count if tab == "followers" else account.following_count
+            ),
             "chart_data": chart_data,
             "stream_views": _stream_views(account),
             "backfill_limit": settings.backfill_limit,

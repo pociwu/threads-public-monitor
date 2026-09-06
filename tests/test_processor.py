@@ -24,6 +24,7 @@ from app.models import (
     RelationshipMember,
     RelationshipScan,
     RelationshipScanMember,
+    RuntimeState,
     StatSnapshot,
 )
 from app.services.collector import (
@@ -170,6 +171,119 @@ class FakeCollector:
 
     def collect_content(self, *_args, **_kwargs):
         return self.contents
+
+
+def test_process_releases_sqlite_write_lock_before_collector_io(tmp_path) -> None:
+    database_path = tmp_path / "processor-lock.db"
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 0.05},
+    )
+    Base.metadata.create_all(engine)
+
+    class ConcurrentWriterCollector(FakeCollector):
+        def collect_profile(self, _username):
+            with Session(engine) as concurrent_db:
+                concurrent_db.connection().exec_driver_sql("PRAGMA busy_timeout=50")
+                concurrent_db.add(RuntimeState(key="collector-heartbeat", value="ok"))
+                concurrent_db.commit()
+            return self.profile
+
+    settings = Settings(
+        database_url=f"sqlite:///{database_path}",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    with Session(engine) as db:
+        account = Account(username="example", status="pending")
+        db.add(account)
+        db.flush()
+        job = Job(account_id=account.id, kind="verify", status="running")
+        db.add(job)
+        db.commit()
+
+        with patch("app.services.processor.ThreadsCollector", ConcurrentWriterCollector):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert job.status == "succeeded"
+        assert db.get(RuntimeState, "collector-heartbeat") is not None
+
+
+def test_relationship_avatar_checkpoint_releases_sqlite_lock_before_http_io(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "relationship-avatar-lock.db"
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 0.05},
+    )
+    Base.metadata.create_all(engine)
+
+    class FakeResponse:
+        headers = {"content-length": "4", "content-type": "image/jpeg"}
+        url = "https://cdn.example/avatar.jpg"
+
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self, _chunk_size):
+            yield b"data"
+
+    class ConcurrentWriteStream:
+        def __enter__(self):
+            with Session(engine) as concurrent_db:
+                concurrent_db.connection().exec_driver_sql("PRAGMA busy_timeout=50")
+                concurrent_db.add(RuntimeState(key="avatar-heartbeat", value="ok"))
+                concurrent_db.commit()
+            return FakeResponse()
+
+        def __exit__(self, *_args):
+            pass
+
+    settings = Settings(
+        database_url=f"sqlite:///{database_path}",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    settings.ensure_directories()
+    with Session(engine) as db:
+        account = Account(username="example", status="active", follower_count=1)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 9),
+            status="running",
+        )
+        db.add(scan)
+        db.commit()
+
+        with patch(
+            "app.services.media.httpx.stream", return_value=ConcurrentWriteStream()
+        ):
+            JobProcessor(settings)._save_relationship_batch(
+                db,
+                account,
+                scan,
+                RelationshipBatch(
+                    members=[
+                        RelationshipMemberData(
+                            username="alice",
+                            display_name="Alice",
+                            avatar_url="https://cdn.example/avatar.jpg",
+                        )
+                    ],
+                    cursor="alice",
+                    complete=False,
+                ),
+            )
+        db.commit()
+
+        assert db.get(RuntimeState, "avatar-heartbeat") is not None
 
 
 def test_profile_job_versions_profile_and_schedules_stream(tmp_path) -> None:
@@ -572,7 +686,11 @@ def test_content_success_does_not_replace_last_scheduled_profile_visit(tmp_path)
         assert account.next_due_at == next_visit
 
 
-def relationship_batch(*usernames: str, complete: bool = True) -> RelationshipBatch:
+def relationship_batch(
+    *usernames: str,
+    complete: bool = True,
+    observed_usernames: set[str] | None = None,
+) -> RelationshipBatch:
     return RelationshipBatch(
         members=[
             RelationshipMemberData(username=name, display_name=name.title(), avatar_url=None)
@@ -580,7 +698,77 @@ def relationship_batch(*usernames: str, complete: bool = True) -> RelationshipBa
         ],
         cursor=usernames[-1] if usernames else None,
         complete=complete,
+        observed_usernames=observed_usernames,
     )
+
+
+def test_relationship_batch_reuses_unchanged_canonical_avatar(tmp_path) -> None:
+    class NoDownloadMediaStore:
+        def register(self, *_args, **_kwargs):
+            raise AssertionError("unchanged avatar must not be registered again")
+
+        def download(self, *_args, **_kwargs):
+            raise AssertionError("unchanged avatar must not be downloaded again")
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    processor.media = NoDownloadMediaStore()
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=1)
+        avatar = MediaAsset(
+            source_url=(
+                "https://scontent.cdninstagram.com/v/t51/avatar.jpg"
+                "?ig_cache_key=STABLE&oh=old-signature"
+            ),
+            source_key="old-avatar",
+            media_type="image",
+            local_path="aa/avatar.jpg",
+            download_status="downloaded",
+        )
+        db.add_all([account, avatar])
+        db.flush()
+        member = RelationshipMember(
+            account_id=account.id,
+            relationship_type="followers",
+            username="alice",
+            avatar_media_id=avatar.id,
+            active=True,
+        )
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 9),
+            status="running",
+        )
+        db.add_all([member, scan])
+        db.flush()
+
+        processor._save_relationship_batch(
+            db,
+            account,
+            scan,
+            RelationshipBatch(
+                members=[
+                    RelationshipMemberData(
+                        username="alice",
+                        display_name="Alice",
+                        avatar_url=(
+                            "https://scontent.cdninstagram.com/v/t51/avatar.jpg"
+                            "?ig_cache_key=STABLE&oh=new-signature"
+                        ),
+                    )
+                ],
+                cursor="alice",
+                complete=False,
+            ),
+        )
+
+        assert member.avatar_media_id == avatar.id
+        assert scan.collected_count == 1
 
 
 def test_relationship_scans_create_baseline_then_daily_added_removed_diff(tmp_path) -> None:
@@ -637,6 +825,160 @@ def test_relationship_scans_create_baseline_then_daily_added_removed_diff(tmp_pa
         assert members["carol"].active is True
 
 
+def test_final_relationship_traversal_replaces_stale_partial_batch_members(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=2)
+        db.add(account)
+        db.flush()
+        baseline = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 3),
+            status="running",
+        )
+        db.add(baseline)
+        db.flush()
+        processor._save_relationship_batch(
+            db,
+            account,
+            baseline,
+            relationship_batch(
+                "alice",
+                "bob",
+                observed_usernames={"alice", "bob"},
+            ),
+        )
+
+        current = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 4),
+            status="running",
+        )
+        db.add(current)
+        db.flush()
+        processor._save_relationship_batch(
+            db,
+            account,
+            current,
+            relationship_batch("alice", complete=False),
+        )
+        processor._save_relationship_batch(
+            db,
+            account,
+            current,
+            relationship_batch("bob", observed_usernames={"bob"}),
+        )
+        assert current.status == "running"
+        assert current.removal_confirmation_fingerprint is not None
+        processor._save_relationship_batch(
+            db,
+            account,
+            current,
+            relationship_batch(observed_usernames={"bob"}),
+        )
+        db.flush()
+
+        current_usernames = set(
+            db.scalars(
+                select(RelationshipMember.username)
+                .join(
+                    RelationshipScanMember,
+                    RelationshipScanMember.member_id == RelationshipMember.id,
+                )
+                .where(RelationshipScanMember.scan_id == current.id)
+            ).all()
+        )
+        changes = db.scalars(
+            select(RelationshipChange).where(RelationshipChange.scan_id == current.id)
+        ).all()
+
+        assert current.status == "complete"
+        assert current.collected_count == 1
+        assert current_usernames == {"bob"}
+        assert [(change.change_type, change.member.username) for change in changes] == [
+            ("removed", "alice")
+        ]
+
+
+def test_relationship_removal_candidate_disappearing_on_second_pass_is_not_emitted(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=2)
+        db.add(account)
+        db.flush()
+        baseline = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 3),
+            status="running",
+        )
+        db.add(baseline)
+        db.flush()
+        processor._save_relationship_batch(
+            db,
+            account,
+            baseline,
+            relationship_batch(
+                "alice",
+                "bob",
+                observed_usernames={"alice", "bob"},
+            ),
+        )
+
+        current = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 4),
+            status="running",
+        )
+        db.add(current)
+        db.flush()
+        processor._save_relationship_batch(
+            db,
+            account,
+            current,
+            relationship_batch("bob", observed_usernames={"bob"}),
+        )
+
+        assert current.status == "running"
+        assert current.removal_confirmation_fingerprint is not None
+        assert db.scalar(
+            select(func.count(RelationshipChange.id)).where(
+                RelationshipChange.scan_id == current.id
+            )
+        ) == 0
+
+        processor._save_relationship_batch(
+            db,
+            account,
+            current,
+            relationship_batch("alice", observed_usernames={"alice", "bob"}),
+        )
+        db.flush()
+
+        assert current.status == "complete"
+        assert current.removal_confirmation_fingerprint is None
+        assert db.scalar(
+            select(func.count(RelationshipChange.id)).where(
+                RelationshipChange.scan_id == current.id
+            )
+        ) == 0
+
+
 def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -666,6 +1008,56 @@ def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> 
 
         assert scan.status == "running"
         assert scan.collected_count == 0
+
+
+def test_rejected_empty_completion_preserves_saved_relationship_progress(tmp_path) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 8),
+            status="running",
+        )
+        db.add(scan)
+        db.flush()
+        processor._save_relationship_batch(
+            db,
+            account,
+            scan,
+            relationship_batch("alice", complete=False),
+        )
+
+        with pytest.raises(TransientRelationshipError, match="粉絲清單尚未載入"):
+            processor._save_relationship_batch(
+                db,
+                account,
+                scan,
+                relationship_batch(complete=True, observed_usernames=set()),
+            )
+        db.flush()
+
+        saved_usernames = set(
+            db.scalars(
+                select(RelationshipMember.username)
+                .join(
+                    RelationshipScanMember,
+                    RelationshipScanMember.member_id == RelationshipMember.id,
+                )
+                .where(RelationshipScanMember.scan_id == scan.id)
+            ).all()
+        )
+        assert scan.status == "running"
+        assert scan.collected_count == 1
+        assert saved_usernames == {"alice"}
 
 
 def test_unknown_relationship_total_cannot_complete_as_empty(tmp_path) -> None:
@@ -774,7 +1166,7 @@ def test_follower_batch_discovers_following_count_and_queues_following_scan(tmp_
         assert queued is not None
 
 
-def test_relationship_scan_cannot_complete_before_known_total(tmp_path) -> None:
+def test_relationship_scan_completes_at_accessible_end_below_profile_total(tmp_path) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         media_root=tmp_path / "media",
@@ -803,7 +1195,122 @@ def test_relationship_scan_cannot_complete_before_known_total(tmp_path) -> None:
         db.flush()
 
         assert scan.collected_count == 2
-        assert scan.status == "running"
+        assert scan.status == "complete"
+
+
+def test_schedule_does_not_reopen_accessibly_complete_scan_below_profile_total(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        timezone="UTC",
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    processor = JobProcessor(settings)
+    today = datetime.now(settings.tz).date()
+    with make_session() as db:
+        account = Account(username="example", status="active", follower_count=51)
+        db.add(account)
+        db.flush()
+        complete_scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=today,
+            status="complete",
+            collected_count=2,
+            completed_at=datetime(2026, 8, 26, 4, 0),
+        )
+        db.add(complete_scan)
+        db.flush()
+
+        processor._schedule_relationship_scans(db, account)
+        db.flush()
+
+        assert complete_scan.status == "complete"
+        queued = db.scalar(
+            select(func.count(Job.id)).where(
+                Job.account_id == account.id,
+                Job.kind == "relationship",
+                Job.content_type == "followers",
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        assert queued == 0
+
+
+@pytest.mark.parametrize(
+    ("configured_batch_size", "relationship_count", "expected_batch_size"),
+    [
+        (5, 51, 25),
+        (24, 51, 25),
+        (25, 51, 25),
+        (25, 628, 50),
+        (50, 51, 50),
+        (1_000, 51, 50),
+    ],
+)
+def test_relationship_job_clamps_batch_size_to_safe_range(
+    tmp_path,
+    configured_batch_size,
+    relationship_count,
+    expected_batch_size,
+) -> None:
+    class CapturingRelationshipCollector(FakeCollector):
+        collected_limit = None
+
+        def collect_relationships(
+            self,
+            _username,
+            _relationship_type,
+            limit,
+            **_kwargs,
+        ):
+            type(self).collected_limit = limit
+            return relationship_batch("alice", complete=False)
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+        timezone="UTC",
+        relationship_batch_size=configured_batch_size,
+        batch_min_delay_seconds=0,
+        batch_max_delay_seconds=0,
+    )
+    with make_session() as db:
+        account = Account(
+            username="example",
+            status="active",
+            follower_count=relationship_count,
+        )
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="followers",
+            scan_date=date(2026, 8, 26),
+            status="running",
+        )
+        job = Job(
+            account_id=account.id,
+            kind="relationship",
+            content_type="followers",
+            status="running",
+        )
+        db.add_all([scan, job])
+        db.commit()
+
+        with patch(
+            "app.services.processor.ThreadsCollector",
+            CapturingRelationshipCollector,
+        ):
+            JobProcessor(settings).process(db, job)
+        db.commit()
+
+        assert CapturingRelationshipCollector.collected_limit == expected_batch_size
 
 
 def test_empty_incomplete_relationship_batch_is_transient_no_progress(tmp_path) -> None:

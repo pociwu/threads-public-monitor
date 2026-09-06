@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -12,8 +13,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from playwright.sync_api import BrowserContext, Locator, Page, Response, sync_playwright
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import (
+    BrowserContext,
+    Locator,
+    Page,
+    Response,
+    sync_playwright,
+)
+from playwright.sync_api import (
+    Error as PlaywrightError,
+)
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from app.config import Settings
 from app.services.content_text import clean_content_text
@@ -25,6 +37,11 @@ ACTIVE_RELATIONSHIP_DIALOG_SELECTOR = (
 )
 RATE_LIMIT_RESOURCE_TYPES = frozenset({"document", "xhr", "fetch"})
 META_UI_HOST_SUFFIXES = ("threads.com", "threads.net", "instagram.com", "facebook.com")
+RELATIONSHIP_SCROLL_MIN_DELAY_MS = 750
+RELATIONSHIP_SCROLL_MAX_DELAY_MS = 1_250
+RELATIONSHIP_END_STABLE_MS = 8_000
+RELATIONSHIP_NON_SCROLLABLE_END_STABLE_MS = 20_000
+RELATIONSHIP_MAX_SCROLL_TURNS = 160
 
 
 class CollectionError(RuntimeError):
@@ -98,6 +115,7 @@ class RelationshipBatch:
     complete: bool
     follower_count: int | None = None
     following_count: int | None = None
+    observed_usernames: set[str] | None = None
 
 
 def parse_count(value: str | None) -> int | None:
@@ -589,7 +607,7 @@ class ThreadsCollector:
         self,
         username: str,
         relationship_type: str,
-        limit: int = 5,
+        limit: int = 25,
         cursor: str | None = None,
         expected_count: int | None = None,
         seen_usernames: set[str] | None = None,
@@ -682,128 +700,22 @@ class ThreadsCollector:
                 raise TransientRelationshipError(
                     self._relationship_timeout_message(relationship_type)
                 ) from exc
-            raw: dict[str, Any] = dialog.evaluate(
-                r"""async (dialog, {owner, limit, cursor, expectedCount, seenUsernames}) => {
-                  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-                  const candidates = [dialog, ...dialog.querySelectorAll('*')]
-                    .filter(el => el.scrollHeight > el.clientHeight + 40);
-                  const scroller = candidates.sort(
-                    (a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
-                  )[0] || dialog;
-                  const ordered = [];
-                  const seen = new Set();
-                  const previouslySaved = new Set(
-                    (seenUsernames || []).map(value => value.toLowerCase())
-                  );
-                  let cursorFound = !cursor;
-                  let stagnant = 0;
-                  let previousSize = 0;
-                  let complete = false;
-                  let atEnd = false;
-                  const hasKnownTotal = Number.isInteger(expectedCount) && expectedCount >= 0;
-                  const avatarUrlFrom = root => {
-                    const image = root.querySelector('img[src],img[srcset]');
-                    if (image?.currentSrc || image?.src) return image.currentSrc || image.src;
-                    const svgImage = root.querySelector('image[href]');
-                    const svgHref = svgImage?.href?.baseVal || svgImage?.getAttribute('href');
-                    if (svgHref) return svgHref;
-                    for (const element of [root, ...root.querySelectorAll('*')]) {
-                      const background = getComputedStyle(element).backgroundImage || '';
-                      const match = background.match(/^url\(["']?(.*?)["']?\)$/);
-                      if (match?.[1] && !match[1].startsWith('data:')) return match[1];
-                    }
-                    return null;
-                  };
-
-                  for (let turn = 0; turn < 80; turn++) {
-                    for (const anchor of dialog.querySelectorAll('a[href*="/@"]')) {
-                      let pathname = '';
-                      try {
-                        pathname = new URL(
-                          anchor.getAttribute('href') || anchor.href || '', location.origin
-                        ).pathname;
-                      } catch (_error) {
-                        continue;
-                      }
-                      const match = pathname.match(/^\/@([^/?#]+)/);
-                      if (!match) continue;
-                      const memberUsername = decodeURIComponent(match[1]).toLowerCase();
-                      if (memberUsername === owner.toLowerCase() || seen.has(memberUsername)) continue;
-                      let item = anchor;
-                      for (let level = 0; level < 10 && item.parentElement; level++) {
-                        item = item.parentElement;
-                        if (avatarUrlFrom(item) && item.innerText.trim().length > 0) break;
-                      }
-                      const avatarUrl = avatarUrlFrom(item);
-                      const lines = (item.innerText || '').split('\n').map(v => v.trim()).filter(Boolean);
-                      const displayName = lines.find(line =>
-                        line.toLowerCase() !== memberUsername &&
-                        line.toLowerCase() !== `@${memberUsername}` &&
-                        !/追蹤|follow/i.test(line)
-                      ) || null;
-                      seen.add(memberUsername);
-                      ordered.push({
-                        username: memberUsername,
-                        displayName,
-                        avatarUrl
-                      });
-                      if (memberUsername === (cursor || '').toLowerCase()) cursorFound = true;
-                    }
-
-                    const afterCursor = (cursorFound
-                      ? ordered.slice(cursor ? ordered.findIndex(m => m.username === cursor.toLowerCase()) + 1 : 0)
-                      : ordered
-                    ).filter(member => !previouslySaved.has(member.username));
-                    if (afterCursor.length >= limit) {
-                      return {
-                        members: afterCursor.slice(0, limit), complete: false,
-                        cursorFound, available: true
-                      };
-                    }
-                    atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
-                    if (atEnd && ordered.length === previousSize) stagnant += 1;
-                    else stagnant = 0;
-                    // Threads often renders an empty dialog before its member rows arrive.
-                    // Do not treat that transient state as a complete empty list.
-                    const reachedKnownTotal = hasKnownTotal && ordered.length >= expectedCount;
-                    const reachedUnknownEnd = !hasKnownTotal && ordered.length > 0;
-                    const reachedAccessibleEnd = ordered.length > 0 && stagnant >= 8;
-                    if (atEnd && (
-                      (stagnant >= 2 && (reachedKnownTotal || reachedUnknownEnd)) ||
-                      reachedAccessibleEnd
-                    )) {
-                      complete = true;
-                      return {
-                        members: afterCursor.slice(0, limit), complete,
-                        cursorFound, available: true
-                      };
-                    }
-                    previousSize = ordered.length;
-                    scroller.scrollTop = Math.min(
-                      scroller.scrollTop + Math.max(scroller.clientHeight * 0.8, 320),
-                      scroller.scrollHeight
-                    );
-                    scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
-                    await sleep(450);
-                  }
-                  const start = cursorFound && cursor
-                    ? ordered.findIndex(m => m.username === cursor.toLowerCase()) + 1 : 0;
-                  const members = ordered.slice(start)
-                    .filter(member => !previouslySaved.has(member.username))
-                    .slice(0, limit);
-                  return {
-                    members, complete: false, cursorFound, available: true,
-                    atEnd, stagnant, orderedCount: ordered.length
-                  };
-                }""",
-                {
-                    "owner": username,
-                    "limit": limit,
-                    "cursor": cursor,
-                    "expectedCount": effective_expected_count,
-                    "seenUsernames": sorted(seen_usernames or set()),
-                },
-            )
+            try:
+                raw = self._scan_relationship_dialog(
+                    page,
+                    dialog,
+                    owner=username,
+                    limit=limit,
+                    cursor=cursor,
+                    expected_count=effective_expected_count,
+                    seen_usernames=seen_usernames or set(),
+                )
+            except PlaywrightError as exc:
+                self._raise_if_rate_limited()
+                self._save_relationship_diagnostic(page, username, relationship_type)
+                raise TransientRelationshipError(
+                    "Threads 關係名單掃描中斷，已保留目前進度"
+                ) from exc
             self._raise_if_rate_limited()
             if not raw.get("available", True):
                 raise CollectionError("Threads 名單視窗未成功開啟")
@@ -818,25 +730,280 @@ class ThreadsCollector:
                 for item in raw.get("members", [])
                 if item.get("username")
             ]
+            complete = self._relationship_batch_complete(raw)
             return RelationshipBatch(
                 members=members,
                 cursor=members[-1].username if members else cursor,
-                complete=self._relationship_batch_complete(raw),
+                complete=complete,
                 follower_count=parse_count(relationship_counts.get("followers")),
                 following_count=parse_count(relationship_counts.get("following")),
+                observed_usernames=(
+                    {
+                        str(value).strip().lstrip("@").casefold()
+                        for value in raw.get("observedUsernames", [])
+                        if str(value).strip().lstrip("@")
+                    }
+                    if complete and "observedUsernames" in raw
+                    else None
+                ),
             )
         finally:
             page.close()
 
+    def _scan_relationship_dialog(
+        self,
+        page: Page,
+        dialog: Locator,
+        *,
+        owner: str,
+        limit: int,
+        cursor: str | None,
+        expected_count: int | None,
+        seen_usernames: set[str],
+    ) -> dict[str, Any]:
+        """Read one relationship batch while yielding to Python between scrolls.
+
+        Threads virtualizes the dialog, so each snapshot can contain different rows.
+        Keeping the loop in Python lets response callbacks surface a 429 before the
+        next scroll and lets us use a conservative, jittered interaction cadence.
+        """
+        snapshot_script = r"""(dialog, {owner}) => {
+          const avatarUrlFrom = root => {
+            const image = root.querySelector('img[src],img[srcset]');
+            if (image?.currentSrc || image?.src) return image.currentSrc || image.src;
+            const svgImage = root.querySelector('image[href]');
+            const svgHref = svgImage?.href?.baseVal || svgImage?.getAttribute('href');
+            if (svgHref) return svgHref;
+            for (const element of [root, ...root.querySelectorAll('*')]) {
+              const background = getComputedStyle(element).backgroundImage || '';
+              const match = background.match(/^url\(["']?(.*?)["']?\)$/);
+              if (match?.[1] && !match[1].startsWith('data:')) return match[1];
+            }
+            return null;
+          };
+          const members = [];
+          const visibleUsernames = new Set();
+          for (const anchor of dialog.querySelectorAll('a[href*="/@"]')) {
+            let pathname = '';
+            try {
+              pathname = new URL(
+                anchor.getAttribute('href') || anchor.href || '', location.origin
+              ).pathname;
+            } catch (_error) {
+              continue;
+            }
+            const match = pathname.match(/^\/@([^/?#]+)/);
+            if (!match) continue;
+            const memberUsername = decodeURIComponent(match[1]).toLowerCase();
+            if (memberUsername === owner.toLowerCase() || visibleUsernames.has(memberUsername)) {
+              continue;
+            }
+            let item = anchor;
+            for (let level = 0; level < 10 && item.parentElement; level++) {
+              item = item.parentElement;
+              if (avatarUrlFrom(item) && item.innerText.trim().length > 0) break;
+            }
+            const lines = (item.innerText || '')
+              .split('\n').map(value => value.trim()).filter(Boolean);
+            const displayName = lines.find(line =>
+              line.toLowerCase() !== memberUsername &&
+              line.toLowerCase() !== `@${memberUsername}` &&
+              !/追蹤|follow/i.test(line)
+            ) || null;
+            visibleUsernames.add(memberUsername);
+            members.push({
+              username: memberUsername,
+              displayName,
+              avatarUrl: avatarUrlFrom(item)
+            });
+          }
+
+          const rateLimitPattern = /請稍後再試|請稍候再試|稍後再試|try again later|too many requests|please wait a few minutes|rate[ -]?limit/i;
+          const noticeText = [...document.querySelectorAll(
+            '[role="alert"],[role="status"],[role="dialog"],[aria-modal="true"]'
+          )]
+            .filter(element => {
+              const bounds = element.getBoundingClientRect();
+              const style = getComputedStyle(element);
+              return bounds.width > 0 && bounds.height > 0 &&
+                style.display !== 'none' && style.visibility !== 'hidden';
+            })
+            .map(element => element.innerText || element.textContent || '')
+            .join(' ');
+          const pageText = document.body?.innerText || '';
+          const rateLimited = rateLimitPattern.test(noticeText) ||
+            (members.length === 0 && rateLimitPattern.test(pageText));
+
+          const candidates = [dialog, ...dialog.querySelectorAll('*')]
+            .filter(element => {
+              const bounds = element.getBoundingClientRect();
+              const style = getComputedStyle(element);
+              return bounds.width > 0 && bounds.height > 0 &&
+                style.display !== 'none' && style.visibility !== 'hidden' &&
+                element.scrollHeight > element.clientHeight + 40;
+            })
+            .sort((a, b) =>
+              (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
+            );
+          const scrollable = candidates.length > 0;
+          const scroller = candidates[0] || dialog;
+          const beforeTop = Number(scroller.scrollTop || 0);
+          const clientHeight = Number(scroller.clientHeight || 0);
+          const scrollHeight = Number(scroller.scrollHeight || 0);
+          const beforeEnd = beforeTop + clientHeight >= scrollHeight - 8;
+          if (!beforeEnd && scrollable) {
+            scroller.scrollTop = Math.min(
+              beforeTop + Math.max(clientHeight * 0.8, 320),
+              scrollHeight
+            );
+            scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
+          }
+          const scrollTop = Number(scroller.scrollTop || 0);
+          return {
+            members,
+            rateLimited,
+            atEnd: scrollTop + clientHeight >= scrollHeight - 8,
+            scrollable,
+            scrollTop,
+            scrollHeight,
+            clientHeight,
+            moved: scrollTop > beforeTop + 1
+          };
+        }"""
+
+        owner_key = owner.casefold()
+        cursor_key = cursor.casefold() if cursor else None
+        previously_saved = {username.casefold() for username in seen_usernames}
+        ordered: dict[str, dict[str, Any]] = {}
+        cursor_found = cursor_key is None or cursor_key in previously_saved
+        last_signature: tuple[int, int, int, int] | None = None
+        last_snapshot: dict[str, Any] = {}
+        stagnant = 0
+        stable_end_ms = 0
+
+        for turn in range(RELATIONSHIP_MAX_SCROLL_TURNS):
+            self._raise_if_rate_limited()
+            snapshot: dict[str, Any] = dialog.evaluate(
+                snapshot_script,
+                {"owner": owner},
+            )
+            self._raise_if_rate_limited()
+            if snapshot.get("rateLimited"):
+                raise RateLimited("Threads 顯示要求稍後再試，已停止本次擷取")
+            last_snapshot = snapshot
+            added = 0
+            for item in snapshot.get("members", []):
+                username = str(item.get("username") or "").strip().lstrip("@")
+                username_key = username.casefold()
+                if not username or username_key == owner_key:
+                    continue
+                if cursor_key is not None and username_key == cursor_key:
+                    cursor_found = True
+                existing = ordered.get(username_key)
+                if existing is None:
+                    ordered[username_key] = {
+                        "username": username,
+                        "displayName": item.get("displayName"),
+                        "avatarUrl": item.get("avatarUrl"),
+                    }
+                    added += 1
+                else:
+                    existing["displayName"] = (
+                        item.get("displayName") or existing.get("displayName")
+                    )
+                    existing["avatarUrl"] = (
+                        item.get("avatarUrl") or existing.get("avatarUrl")
+                    )
+
+            members = [
+                member
+                for username_key, member in ordered.items()
+                if username_key not in previously_saved
+            ]
+            common = {
+                "cursorFound": cursor_found,
+                "available": True,
+                "atEnd": bool(snapshot.get("atEnd")),
+                "orderedCount": len(ordered),
+            }
+            # When the count is exactly the persistence limit, keep observing long
+            # enough to prove the accessible end.  Only an extra member proves that
+            # another checkpoint job is required.
+            if len(members) > limit:
+                return {
+                    **common,
+                    "members": members[:limit],
+                    "complete": False,
+                    "stagnant": stagnant,
+                    "terminationReason": "batch_limit",
+                }
+
+            signature = (
+                len(ordered),
+                round(float(snapshot.get("scrollTop") or 0)),
+                round(float(snapshot.get("scrollHeight") or 0)),
+                round(float(snapshot.get("clientHeight") or 0)),
+            )
+            at_end = bool(snapshot.get("atEnd"))
+            stable_candidate = at_end and added == 0 and signature == last_signature
+            if stable_candidate:
+                stagnant += 1
+            else:
+                stagnant = 0
+                stable_end_ms = 0
+            last_signature = signature
+
+            delay_ms = random.randint(
+                RELATIONSHIP_SCROLL_MIN_DELAY_MS,
+                RELATIONSHIP_SCROLL_MAX_DELAY_MS,
+            )
+            if turn < RELATIONSHIP_MAX_SCROLL_TURNS - 1:
+                page.wait_for_timeout(delay_ms)
+                self._raise_if_rate_limited()
+                if stable_candidate:
+                    stable_end_ms += delay_ms
+
+            has_rows = bool(ordered)
+            known_empty = expected_count == 0
+            count_reached = (
+                expected_count is not None and len(ordered) >= expected_count
+            )
+            stable_requirement_ms = (
+                RELATIONSHIP_END_STABLE_MS
+                if bool(snapshot.get("scrollable", True)) or count_reached
+                else RELATIONSHIP_NON_SCROLLABLE_END_STABLE_MS
+            )
+            if (
+                stable_end_ms >= stable_requirement_ms
+                and (has_rows or known_empty)
+            ):
+                return {
+                    **common,
+                    "members": members[:limit],
+                    "complete": True,
+                    "observedUsernames": [
+                        member["username"] for member in ordered.values()
+                    ],
+                    "stagnant": stagnant,
+                    "stableEndMs": stable_end_ms,
+                    "terminationReason": "accessible_end",
+                }
+
+        return {
+            "members": members[:limit],
+            "complete": False,
+            "cursorFound": cursor_found,
+            "available": True,
+            "atEnd": bool(last_snapshot.get("atEnd")),
+            "stagnant": stagnant,
+            "stableEndMs": stable_end_ms,
+            "orderedCount": len(ordered),
+            "terminationReason": "turn_limit",
+        }
+
     @staticmethod
     def _relationship_batch_complete(raw: dict[str, Any]) -> bool:
-        if raw.get("complete"):
-            return True
-        return bool(
-            raw.get("atEnd")
-            and int(raw.get("stagnant") or 0) >= 8
-            and int(raw.get("orderedCount") or 0) > 0
-        )
+        return bool(raw.get("complete"))
 
     def _click_when_available(self, page: Page, script: str, attempts: int = 60) -> bool:
         for attempt in range(attempts):

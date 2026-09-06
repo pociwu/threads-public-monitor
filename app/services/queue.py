@@ -9,11 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Account, Content, Job, RuntimeState
+from app.models import Account, CollectionRun, Content, Job, RuntimeState
 
 GLOBAL_NEXT_BATCH_KEY = "global-next-batch-at"
 GLOBAL_RATE_LIMIT_KEY = "global-rate-limit"
 GLOBAL_RATE_LIMIT_STATE_VERSION = 1
+INTERRUPTED_JOB_MESSAGE = "Worker 重新啟動，已回收中斷工作並重新排隊"
+INTERRUPTED_RUN_MESSAGE = "Worker 重新啟動，工作執行中斷"
 
 
 class GlobalRateLimitState(TypedDict):
@@ -200,6 +202,31 @@ def enqueue_unique(
     db.add(job)
     db.flush()
     return job
+
+
+def recover_interrupted_jobs(db: Session, now: datetime | None = None) -> int:
+    """Requeue jobs left running when the single worker process was interrupted."""
+    recovered_at = _naive_utc(now) if now is not None else now_utc()
+    jobs = db.scalars(select(Job).where(Job.status == "running")).all()
+    for job in jobs:
+        job.status = "queued"
+        # claim_next_job() consumes one attempt before execution starts.  A
+        # process interruption is not a functional collection failure, so give
+        # that in-flight attempt back when recovering the job.
+        job.attempts = max(job.attempts - 1, 0)
+        job.not_before = recovered_at
+        job.started_at = None
+        job.finished_at = None
+        job.error = INTERRUPTED_JOB_MESSAGE
+
+    runs = db.scalars(select(CollectionRun).where(CollectionRun.status == "running")).all()
+    for run in runs:
+        run.status = "failed"
+        run.finished_at = recovered_at
+        run.message = INTERRUPTED_RUN_MESSAGE
+
+    db.flush()
+    return len(jobs)
 
 
 def schedule_content_refreshes(db: Session, settings: Settings, account_id: int) -> int:

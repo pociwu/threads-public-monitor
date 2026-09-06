@@ -102,6 +102,7 @@ class RelationshipScan(Base):
     status: Mapped[str] = mapped_column(String(24), default="running", index=True)
     cursor: Mapped[str | None] = mapped_column(String(64))
     collected_count: Mapped[int] = mapped_column(Integer, default=0)
+    removal_confirmation_fingerprint: Mapped[str | None] = mapped_column(String(64))
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
 

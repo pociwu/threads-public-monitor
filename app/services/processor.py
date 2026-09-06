@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
@@ -36,6 +37,7 @@ from app.services.collector import (
 )
 from app.services.media import (
     MediaStore,
+    canonical_media_key,
     deduplicate_media_candidates,
     media_equivalent,
     media_identity,
@@ -69,6 +71,10 @@ class JobProcessor:
         )
         db.add(run)
         db.flush()
+        # Persist the run marker before browser/network I/O.  Keeping this INSERT
+        # uncommitted holds SQLite's single writer lock for the entire collection
+        # and prevents otherwise unrelated web/worker writes from completing.
+        db.commit()
         try:
             account = db.get(Account, job.account_id) if job.account_id else None
             if not account or not account.enabled:
@@ -123,6 +129,11 @@ class JobProcessor:
                     scan = self._current_relationship_scan(db, account, job.content_type)
                     if not scan:
                         raise CollectionError("找不到可執行的關係名單掃描")
+                    expected_count = (
+                        account.follower_count
+                        if job.content_type == "followers"
+                        else account.following_count
+                    )
                     seen_usernames = set(
                         db.scalars(
                             select(RelationshipMember.username)
@@ -136,13 +147,9 @@ class JobProcessor:
                     batch = collector.collect_relationships(
                         account.username,
                         job.content_type,
-                        self.settings.relationship_batch_size,
+                        self.settings.relationship_batch_size_for(expected_count),
                         cursor=scan.cursor,
-                        expected_count=(
-                            account.follower_count
-                            if job.content_type == "followers"
-                            else account.following_count
-                        ),
+                        expected_count=expected_count,
                         seen_usernames=seen_usernames,
                     )
                     run.item_count = self._save_relationship_batch(db, account, scan, batch)
@@ -173,7 +180,11 @@ class JobProcessor:
         avatar_id = account.avatar_media_id
         if data.avatar_url:
             avatar = self.media.register(db, data.avatar_url, "image")
-            self.media.download(db, avatar)
+            # A profile has already been collected and no profile-version changes
+            # have been staged yet.  Commit only the registered asset so SQLite
+            # does not retain a writer lock throughout the CDN request.
+            db.commit()
+            avatar = self.media.download(db, avatar)
             avatar_id = avatar.id
 
         latest = db.scalar(
@@ -275,18 +286,6 @@ class JobProcessor:
             if relationship_type == "following" and scan.status == "unavailable":
                 scan.status = "running"
                 scan.completed_at = None
-            expected_count = (
-                account.follower_count
-                if relationship_type == "followers"
-                else account.following_count
-            )
-            if (
-                scan.status == "complete"
-                and expected_count is not None
-                and scan.collected_count < expected_count
-            ):
-                scan.status = "running"
-                scan.completed_at = None
             if scan.status == "running":
                 enqueue_unique(
                     db,
@@ -326,8 +325,38 @@ class JobProcessor:
         if batch.following_count is not None:
             account.following_count = batch.following_count
             self._activate_following_scan(db, account, batch.following_count)
+        expected_count = (
+            account.follower_count
+            if scan.relationship_type == "followers"
+            else account.following_count
+        )
+        if (
+            batch.complete
+            and batch.observed_usernames is not None
+            and not batch.observed_usernames
+            and expected_count != 0
+        ):
+            label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
+            raise TransientRelationshipError(
+                f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單"
+            )
+        awaiting_removal_confirmation = False
+        if batch.complete and batch.observed_usernames is not None:
+            removal_fingerprint = self._relationship_removal_fingerprint(
+                db,
+                account,
+                scan,
+                batch.observed_usernames,
+            )
+            if (
+                removal_fingerprint is not None
+                and scan.removal_confirmation_fingerprint != removal_fingerprint
+            ):
+                scan.removal_confirmation_fingerprint = removal_fingerprint
+                awaiting_removal_confirmation = True
+            else:
+                scan.removal_confirmation_fingerprint = None
         for item in batch.members:
-            avatar_id = None
             member = db.scalar(
                 select(RelationshipMember).where(
                     RelationshipMember.account_id == account.id,
@@ -335,10 +364,32 @@ class JobProcessor:
                     RelationshipMember.username == item.username,
                 )
             )
+            avatar_id = member.avatar_media_id if member is not None else None
             if item.avatar_url:
-                avatar = self.media.register(db, item.avatar_url, "image")
-                self.media.download(db, avatar)
-                avatar_id = avatar.id
+                current_avatar = db.get(MediaAsset, avatar_id) if avatar_id else None
+                current_key = (
+                    canonical_media_key(current_avatar.source_url)
+                    if current_avatar is not None
+                    else None
+                )
+                incoming_key = canonical_media_key(item.avatar_url)
+                unchanged_downloaded_avatar = bool(
+                    current_avatar is not None
+                    and current_avatar.download_status == "downloaded"
+                    and current_avatar.local_path
+                    and (
+                        current_avatar.source_url == item.avatar_url
+                        or (incoming_key is not None and incoming_key == current_key)
+                    )
+                )
+                if not unchanged_downloaded_avatar:
+                    avatar = self.media.register(db, item.avatar_url, "image")
+                    # Relationship scans are checkpointed by design.  Persist the
+                    # asset registration before network I/O so web writes are not
+                    # blocked, without making MediaStore commit its caller's work.
+                    db.commit()
+                    avatar = self.media.download(db, avatar)
+                    avatar_id = avatar.id
             if member is None:
                 member = RelationshipMember(
                     account_id=account.id,
@@ -367,6 +418,26 @@ class JobProcessor:
                 saved += 1
 
         db.flush()
+        if (
+            batch.complete
+            and batch.observed_usernames is not None
+            and not awaiting_removal_confirmation
+        ):
+            observed_usernames = {
+                username.casefold() for username in batch.observed_usernames
+            }
+            scan_members = db.execute(
+                select(RelationshipScanMember, RelationshipMember.username)
+                .join(
+                    RelationshipMember,
+                    RelationshipMember.id == RelationshipScanMember.member_id,
+                )
+                .where(RelationshipScanMember.scan_id == scan.id)
+            ).all()
+            for scan_member, member_username in scan_members:
+                if member_username.casefold() not in observed_usernames:
+                    db.delete(scan_member)
+            db.flush()
         previous_cursor = scan.cursor
         scan.cursor = batch.cursor if saved > 0 else previous_cursor
         scan.collected_count = int(
@@ -377,11 +448,6 @@ class JobProcessor:
             )
             or 0
         )
-        expected_count = (
-            account.follower_count
-            if scan.relationship_type == "followers"
-            else account.following_count
-        )
         if (
             batch.complete
             and scan.collected_count == 0
@@ -391,15 +457,55 @@ class JobProcessor:
             raise TransientRelationshipError(
                 f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單"
             )
-        reached_known_total = expected_count is None or scan.collected_count >= expected_count
-        if batch.complete and reached_known_total:
+        if batch.complete and not awaiting_removal_confirmation:
             self._complete_relationship_scan(db, account, scan)
-        if scan.status == "running" and saved == 0:
+        if (
+            scan.status == "running"
+            and saved == 0
+            and not awaiting_removal_confirmation
+        ):
             label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
             raise TransientRelationshipError(
                 f"Threads {label}清單本批未取得新成員，已保留目前進度"
             )
         return saved
+
+    @staticmethod
+    def _relationship_removal_fingerprint(
+        db: Session,
+        account: Account,
+        scan: RelationshipScan,
+        observed_usernames: set[str],
+    ) -> str | None:
+        previous = db.scalar(
+            select(RelationshipScan)
+            .where(
+                RelationshipScan.account_id == account.id,
+                RelationshipScan.relationship_type == scan.relationship_type,
+                RelationshipScan.status == "complete",
+                RelationshipScan.id != scan.id,
+            )
+            .order_by(RelationshipScan.scan_date.desc(), RelationshipScan.id.desc())
+            .limit(1)
+        )
+        if previous is None:
+            return None
+        previous_usernames = {
+            username.casefold()
+            for username in db.scalars(
+                select(RelationshipMember.username)
+                .join(
+                    RelationshipScanMember,
+                    RelationshipScanMember.member_id == RelationshipMember.id,
+                )
+                .where(RelationshipScanMember.scan_id == previous.id)
+            ).all()
+        }
+        observed = {username.casefold() for username in observed_usernames}
+        removed = sorted(previous_usernames - observed)
+        if not removed:
+            return None
+        return hashlib.sha256("\n".join(removed).encode()).hexdigest()
 
     def _activate_following_scan(
         self, db: Session, account: Account, following_count: int

@@ -1,10 +1,14 @@
+from unittest.mock import patch
+
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from app.config import Settings
 from app.db import Base
 from app.models import Account, Content, ContentMedia, MediaAsset
 from app.services.media import (
+    MediaStore,
     canonical_media_key,
     deduplicate_canonical_content_media_links,
     deduplicate_content_media_links,
@@ -12,6 +16,50 @@ from app.services.media import (
     media_usage_bytes,
     source_key,
 )
+
+
+def test_media_download_does_not_commit_callers_unit_of_work(tmp_path) -> None:
+    database_path = tmp_path / "media-transaction.db"
+    engine = create_engine(
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 0.05},
+    )
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        database_url=f"sqlite:///{database_path}",
+        media_root=tmp_path / "media",
+        browser_profile_dir=tmp_path / "profile",
+    )
+    settings.ensure_directories()
+
+    class FakeResponse:
+        headers = {"content-length": "4", "content-type": "image/jpeg"}
+        url = "https://cdn.example/avatar.jpg"
+
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self, _chunk_size):
+            yield b"data"
+
+    class FakeStream:
+        def __enter__(self):
+            return FakeResponse()
+
+        def __exit__(self, *_args):
+            pass
+
+    with Session(engine) as db:
+        store = MediaStore(settings)
+        db.add(Account(username="uncommitted-account"))
+        asset = store.register(db, "https://cdn.example/avatar.jpg", "image")
+
+        with patch("app.services.media.httpx.stream", return_value=FakeStream()):
+            store.download(db, asset)
+
+        assert asset.download_status == "downloaded"
+        with Session(engine) as observer:
+            assert observer.scalar(select(Account)) is None
 
 
 def test_source_key_is_stable() -> None:
