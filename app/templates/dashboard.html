@@ -63,6 +63,10 @@
       {% if account.status_message %}<p class="status-message">{{ account.status_message }}</p>{% endif %}
     </a>
     <div class="card-actions">
+      <form method="post" action="/accounts/{{ account.id }}/priority">
+        <input type="hidden" name="priority_enabled" value="{{ 'false' if account.priority_enabled else 'true' }}">
+        <button class="button {{ 'primary' if account.priority_enabled else 'ghost' }}" type="submit" role="switch" aria-checked="{{ 'true' if account.priority_enabled else 'false' }}" aria-label="優先處理 @{{ account.username }}" title="同類工作優先；保留輪替、節流與冷卻">優先處理：{{ '開' if account.priority_enabled else '關' }}</button>
+      </form>
       <form method="post" action="/accounts/{{ account.id }}/retry"><button class="button ghost" type="submit" {{ 'disabled' if rate_limit else '' }}>{{ '全域冷卻中' if rate_limit else '立即重試' }}</button></form>
       <form method="post" action="/accounts/{{ account.id }}/stop" data-confirm="停止監看 @{{ account.username }}？歷史資料會保留。"><button class="button ghost" type="submit">停止監看</button></form>
     </div>

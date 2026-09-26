@@ -1,6 +1,8 @@
 from datetime import date
 from importlib import import_module
 
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -12,6 +14,20 @@ from app.models import (
     RelationshipScan,
     RelationshipScanMember,
 )
+
+
+def test_account_priority_upgrade_preserves_existing_account(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    migration = import_module("migrations.versions.0011_account_priority")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE accounts (id INTEGER PRIMARY KEY, username TEXT)")
+        connection.exec_driver_sql("INSERT INTO accounts VALUES (1, 'sin_9311')")
+        monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+        migration.upgrade()
+        migration.upgrade()
+        assert connection.exec_driver_sql(
+            "SELECT username, priority_enabled FROM accounts"
+        ).one() == ("sin_9311", 0)
 
 
 def test_empty_follower_scan_repair_restores_last_known_members(monkeypatch) -> None:

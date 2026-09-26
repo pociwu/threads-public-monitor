@@ -37,6 +37,7 @@ class Account(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     status_message: Mapped[str | None] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    priority_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     interval_hours: Mapped[int] = mapped_column(Integer, default=12)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)

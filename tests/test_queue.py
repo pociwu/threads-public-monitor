@@ -66,6 +66,32 @@ def test_fair_rotation_does_not_claim_future_job() -> None:
         assert claim_next_job(db, settings).kind == "relationship"
 
 
+def test_account_priority_is_live_and_reserves_normal_slots() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", batch_min_delay_seconds=0,
+                        batch_max_delay_seconds=0)
+    with make_session() as db:
+        normal = Account(username="normal")
+        preferred = Account(username="preferred", priority_enabled=True)
+        db.add_all([normal, preferred])
+        db.flush()
+        for account in (normal, preferred):
+            for _ in range(4):
+                db.add(Job(account_id=account.id, kind="content", priority=50,
+                           not_before=now_utc()))
+        db.commit()
+        chosen = []
+        for _ in range(3):
+            job = claim_next_job(db, settings)
+            chosen.append(job.account_id)
+            job.status = "succeeded"
+            db.commit()
+            db.expire_all()
+        assert chosen == [preferred.id, preferred.id, normal.id]
+        preferred.priority_enabled = False
+        db.commit()
+        assert claim_next_job(db, settings).account_id == normal.id
+
+
 def test_enqueue_unique_blocks_duplicate_active_job() -> None:
     with make_session() as db:
         account = Account(username="example", next_due_at=now_utc())

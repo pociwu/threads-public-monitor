@@ -5,7 +5,7 @@ import random
 from datetime import UTC, date, datetime, timedelta
 from typing import TypedDict
 
-from sqlalchemy import case, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -358,10 +358,23 @@ def claim_next_job(db: Session, settings: Settings) -> Job | None:
         rotation = JOB_LANES[start:] + JOB_LANES[:start]
     lane_rank = case({name: rank for rank, name in enumerate(rotation)},
                      value=lane, else_=len(rotation))
+    # After two priority selections in a lane, reserve its next slot for a
+    # normal account if one is ready. State survives worker restarts.
+    prefer_normal = []
+    for name in JOB_LANES:
+        state = db.get(RuntimeState, f"priority-streak:{name}")
+        if state is not None and state.value == "2":
+            prefer_normal.append(name)
+    priority_flag = func.coalesce(Account.priority_enabled, False)
+    account_rank = case(
+        (lane.in_(prefer_normal), case((priority_flag.is_(True), 1), else_=0)),
+        else_=case((priority_flag.is_(True), 0), else_=1),
+    )
     job = db.scalar(
         select(Job)
+        .outerjoin(Account, Account.id == Job.account_id)
         .where(Job.status == "queued", Job.not_before <= now)
-        .order_by(lane_rank, Job.priority, Job.not_before, Job.id)
+        .order_by(lane_rank, account_rank, Job.priority, Job.not_before, Job.id)
         .limit(1)
     )
     if not job:
@@ -369,6 +382,15 @@ def claim_next_job(db: Session, settings: Settings) -> Job | None:
     job.status = "running"
     job.started_at = now
     job.attempts += 1
+    selected_lane = "profile" if job.kind in {"verify", "profile"} else job.kind
+    account = db.get(Account, job.account_id) if job.account_id is not None else None
+    streak_key = f"priority-streak:{selected_lane}"
+    state = db.get(RuntimeState, streak_key)
+    streak = int(state.value) if state is not None and state.value in {"1", "2"} else 0
+    _store_runtime_state(
+        db, streak_key,
+        str(min(streak + 1, 2)) if account and account.priority_enabled else "0",
+    )
     _store_runtime_state(
         db, LAST_JOB_LANE_KEY,
         "profile" if job.kind in {"verify", "profile"} else job.kind,

@@ -62,6 +62,30 @@ def test_dashboard_and_add_account() -> None:
         db.close()
 
 
+def test_priority_switch_persists_without_enqueuing_or_clearing_cooldown() -> None:
+    client, db = make_client()
+    try:
+        account = Account(username="sin_9311", status="active",
+                          cooldown_until=datetime(2099, 1, 1))
+        db.add(account)
+        db.commit()
+        for enabled in (True, True, False):
+            response = client.post(f"/accounts/{account.id}/priority",
+                                   data={"priority_enabled": str(enabled).lower()},
+                                   follow_redirects=False)
+            assert response.status_code == 303
+            db.refresh(account)
+            assert account.priority_enabled is enabled
+            assert account.cooldown_until == datetime(2099, 1, 1)
+            assert db.scalar(select(Job)) is None
+            assert f'aria-checked="{str(enabled).lower()}"' in client.get("/").text
+        assert client.post("/accounts/99999/priority",
+                           data={"priority_enabled": "true"}).status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
 def test_static_stylesheets_are_cache_busted_by_app_version() -> None:
     client, db = make_client()
     try:

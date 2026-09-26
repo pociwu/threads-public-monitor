@@ -274,6 +274,18 @@ def retry_account(account_id: int, db: Session = Depends(get_db)):
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/accounts/{account_id}/priority")
+def update_account_priority(
+    account_id: int, priority_enabled: bool = Form(...), db: Session = Depends(get_db)
+):
+    account = db.get(Account, account_id)
+    if not account or not account.enabled:
+        raise HTTPException(404)
+    account.priority_enabled = priority_enabled
+    db.commit()
+    return RedirectResponse("/", status_code=303)
+
+
 @app.post("/accounts/{account_id}/stop")
 def stop_account(account_id: int, db: Session = Depends(get_db)):
     account = db.get(Account, account_id)
