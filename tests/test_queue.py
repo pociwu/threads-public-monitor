@@ -34,6 +34,38 @@ def make_session() -> Session:
     return Session(engine)
 
 
+def test_replenished_relationships_cannot_starve_content_or_refresh() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", batch_min_delay_seconds=0,
+                        batch_max_delay_seconds=0, daily_batch_limit=200)
+    with make_session() as db:
+        kinds = [("profile", 10), ("relationship", 40), ("content", 50),
+                 ("content_refresh", 50)]
+        for kind, priority in kinds:
+            db.add(Job(kind=kind, priority=priority, not_before=now_utc()))
+        db.commit()
+        claimed = []
+        for _ in range(8):
+            job = claim_next_job(db, settings)
+            assert job is not None
+            claimed.append(job.kind)
+            job.status = "succeeded"
+            db.add(Job(kind=job.kind, priority=job.priority, not_before=now_utc()))
+            db.commit()
+            db.expire_all()  # Rotation must survive reloading persisted state.
+        assert set(claimed[:4]) == {kind for kind, _ in kinds}
+        assert claimed[:4] == claimed[4:]
+
+
+def test_fair_rotation_does_not_claim_future_job() -> None:
+    settings = Settings(database_url="sqlite:///:memory:")
+    with make_session() as db:
+        db.add_all([Job(kind="content", priority=50,
+                        not_before=now_utc() + timedelta(days=1)),
+                    Job(kind="relationship", priority=40, not_before=now_utc())])
+        db.commit()
+        assert claim_next_job(db, settings).kind == "relationship"
+
+
 def test_enqueue_unique_blocks_duplicate_active_job() -> None:
     with make_session() as db:
         account = Account(username="example", next_due_at=now_utc())

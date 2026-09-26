@@ -42,7 +42,7 @@ def content_item(threads_id: str, content_type: str = "post") -> ContentData:
     )
 
 
-def test_content_notifications_only_queue_incremental_posts_and_replies(tmp_path) -> None:
+def test_content_notifications_queue_all_four_incremental_types(tmp_path) -> None:
     service = NotificationService(telegram_settings(tmp_path))
     with make_session() as db:
         account = Account(username="example", status="active")
@@ -52,6 +52,9 @@ def test_content_notifications_only_queue_incremental_posts_and_replies(tmp_path
         service.queue_content_changes(db, account, "backfill", "post", [content_item("old-post")])
         service.queue_content_changes(
             db, account, "incremental", "repost", [content_item("repost", "repost")]
+        )
+        service.queue_content_changes(
+            db, account, "incremental", "quote", [content_item("quote", "quote")]
         )
         service.queue_content_changes(
             db,
@@ -66,11 +69,13 @@ def test_content_notifications_only_queue_incremental_posts_and_replies(tmp_path
         db.flush()
 
         rows = db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id)).all()
-        assert len(rows) == 2
-        assert "新串文" in rows[0].body
-        assert "共 2 則" in rows[0].body
-        assert "new-post" in rows[0].body
-        assert "新回覆" in rows[1].body
+        assert len(rows) == 4
+        assert "新轉發" in rows[0].body
+        assert "新引用" in rows[1].body
+        assert "新串文" in rows[2].body
+        assert "共 2 則" in rows[2].body
+        assert "new-post" in rows[2].body
+        assert "新回覆" in rows[3].body
 
 
 def test_relationship_notification_is_batched_and_deduplicated(tmp_path) -> None:
@@ -107,6 +112,23 @@ def test_relationship_notification_is_batched_and_deduplicated(tmp_path) -> None
         assert "@alice" in rows[0].body
         assert "退出 1" in rows[0].body
         assert "@carol" in rows[0].body
+
+
+def test_same_repost_by_two_accounts_notifies_both_once(tmp_path) -> None:
+    service = NotificationService(telegram_settings(tmp_path))
+    with make_session() as db:
+        accounts = [Account(username="first"), Account(username="second")]
+        db.add_all(accounts)
+        db.flush()
+        for account in accounts:
+            for _ in range(2):
+                service.queue_content_changes(
+                    db, account, "incremental", "repost", [content_item("shared", "repost")]
+                )
+                db.flush()
+        rows = db.scalars(select(NotificationOutbox)).all()
+        assert len(rows) == 2
+        assert {row.account_id for row in rows} == {account.id for account in accounts}
 
 
 def test_final_relationship_failure_notification_includes_progress_and_reason(

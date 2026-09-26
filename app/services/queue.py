@@ -5,13 +5,16 @@ import random
 from datetime import UTC, date, datetime, timedelta
 from typing import TypedDict
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.models import Account, CollectionRun, Content, Job, RuntimeState
 
 GLOBAL_NEXT_BATCH_KEY = "global-next-batch-at"
+LAST_JOB_LANE_KEY = "last-job-lane"
+# A busy lane must not consume all globally throttled collection slots.
+JOB_LANES = ("content", "relationship", "content_refresh", "profile")
 GLOBAL_RATE_LIMIT_KEY = "global-rate-limit"
 GLOBAL_RATE_LIMIT_STATE_VERSION = 1
 INTERRUPTED_JOB_MESSAGE = "Worker 重新啟動，已回收中斷工作並重新排隊"
@@ -344,10 +347,21 @@ def claim_next_job(db: Session, settings: Settings) -> Job | None:
     global_not_before = global_next_batch_at(db)
     if global_not_before and global_not_before > now:
         return None
+    lane = case(
+        (Job.kind.in_(["verify", "profile"]), "profile"),
+        else_=Job.kind,
+    )
+    previous = db.get(RuntimeState, LAST_JOB_LANE_KEY)
+    rotation = JOB_LANES
+    if previous is not None and previous.value in JOB_LANES:
+        start = JOB_LANES.index(previous.value) + 1
+        rotation = JOB_LANES[start:] + JOB_LANES[:start]
+    lane_rank = case({name: rank for rank, name in enumerate(rotation)},
+                     value=lane, else_=len(rotation))
     job = db.scalar(
         select(Job)
         .where(Job.status == "queued", Job.not_before <= now)
-        .order_by(Job.priority, Job.not_before, Job.id)
+        .order_by(lane_rank, Job.priority, Job.not_before, Job.id)
         .limit(1)
     )
     if not job:
@@ -355,6 +369,10 @@ def claim_next_job(db: Session, settings: Settings) -> Job | None:
     job.status = "running"
     job.started_at = now
     job.attempts += 1
+    _store_runtime_state(
+        db, LAST_JOB_LANE_KEY,
+        "profile" if job.kind in {"verify", "profile"} else job.kind,
+    )
     increment_daily_batch_count(db, settings)
     defer_global_next_batch(db, settings, now)
     db.flush()

@@ -70,15 +70,20 @@ class NotificationService:
         if (
             not self.settings.telegram_notifications_enabled
             or stream_phase != "incremental"
-            or content_type not in {"post", "reply"}
+            or content_type not in {"post", "reply", "quote", "repost"}
             or not items
         ):
             return
         digest = hashlib.sha256(
             "\n".join(sorted(item.threads_id for item in items)).encode("utf-8")
         ).hexdigest()[:24]
-        label = "新串文" if content_type == "post" else "新回覆"
-        lines = [f"{'🧵' if content_type == 'post' else '💬'} {label} · @{account.username}"]
+        icon, label = {
+            "post": ("🧵", "新串文"),
+            "reply": ("💬", "新回覆"),
+            "quote": ("❝", "新引用"),
+            "repost": ("🔁", "新轉發"),
+        }[content_type]
+        lines = [f"{icon} {label} · @{account.username}"]
         if len(items) > 1:
             lines.append(f"共 {len(items)} 則")
         for index, item in enumerate(items[:10], start=1):
@@ -88,7 +93,7 @@ class NotificationService:
             lines.append(f"另 {len(items) - 10} 則未列出")
         self._queue(
             db,
-            event_key=f"content:{content_type}:{digest}",
+            event_key=f"content:{account.id}:{content_type}:{digest}",
             event_type=f"content_{content_type}",
             account=account,
             body="\n".join(lines)[:4096],

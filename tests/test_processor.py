@@ -40,7 +40,8 @@ from app.services.collector import (
 from app.services.processor import JobProcessor
 
 
-def test_incremental_content_batch_queues_telegram_notification(tmp_path) -> None:
+@pytest.mark.parametrize("content_type", ["post", "reply", "quote", "repost"])
+def test_incremental_content_batch_queues_telegram_notification(tmp_path, content_type) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         media_root=tmp_path / "media",
@@ -58,19 +59,24 @@ def test_incremental_content_batch_queues_telegram_notification(tmp_path) -> Non
         db.add(
             CollectionStream(
                 account_id=account.id,
-                content_type="post",
+                content_type=content_type,
                 phase="incremental",
             )
         )
         db.flush()
 
-        processor._save_content_batch(db, account, "post", [FakeCollector.contents[0]])
+        from dataclasses import replace
+
+        item = replace(FakeCollector.contents[0], content_type=content_type)
+        processor._save_content_batch(db, account, content_type, [item])
+        processor._save_content_batch(db, account, content_type, [item])
         db.flush()
 
         notification = db.scalar(select(NotificationOutbox))
         assert notification is not None
-        assert notification.event_type == "content_post"
+        assert notification.event_type == f"content_{content_type}"
         assert "第一則內容" in notification.body
+        assert db.scalar(select(func.count(NotificationOutbox.id))) == 1
 
 
 def test_complete_relationship_scan_queues_only_real_diff(tmp_path) -> None:
