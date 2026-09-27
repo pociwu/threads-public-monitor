@@ -336,6 +336,9 @@ def test_content_collection_stops_scrolling_after_xhr_429(tmp_path) -> None:
             self.closed = False
             self.waits = 0
 
+        def evaluate(self, _script, _args):
+            return []
+
         def wait_for_timeout(self, milliseconds):
             assert milliseconds == 800
             self.waits += 1
