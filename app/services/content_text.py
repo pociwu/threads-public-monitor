@@ -10,15 +10,9 @@ _INTERACTION_TOKEN_RE = re.compile(_INTERACTION_TOKEN, re.I)
 _INTERACTION_LINE = re.compile(rf"^(?:{_INTERACTION_TOKEN}\s*)+$", re.I)
 _CAROUSEL = r"\d+\s*/\s*\d+"
 _CAROUSEL_LINE = re.compile(rf"^{_CAROUSEL}$")
-_CAROUSEL_WITH_INTERACTIONS = re.compile(
-    rf"^{_CAROUSEL}\s*(?:{_INTERACTION_TOKEN}\s*)+$", re.I
-)
-_INLINE_CAROUSEL_SUFFIX = re.compile(
-    rf"\s+{_CAROUSEL}\s*(?:{_INTERACTION_TOKEN}\s*)+$", re.I
-)
-_INLINE_INTERACTION_SUFFIX = re.compile(
-    rf"\s+(?:{_INTERACTION_TOKEN}\s*){{2,}}$", re.I
-)
+_CAROUSEL_WITH_INTERACTIONS = re.compile(rf"^{_CAROUSEL}\s*(?:{_INTERACTION_TOKEN}\s*)+$", re.I)
+_INLINE_CAROUSEL_SUFFIX = re.compile(rf"\s+{_CAROUSEL}\s*(?:{_INTERACTION_TOKEN}\s*)+$", re.I)
+_INLINE_INTERACTION_SUFFIX = re.compile(rf"\s+(?:{_INTERACTION_TOKEN}\s*){{2,}}$", re.I)
 _INLINE_CAROUSEL_ONLY = re.compile(rf"\s+{_CAROUSEL}$")
 _DATE_OR_SEPARATOR = re.compile(r"^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|/)$")
 _NUMERIC = re.compile(r"^[\d,.]+\s*[萬万千KkMm]?(?:\s*次)?$")
@@ -81,9 +75,7 @@ def _remove_trailing_interactions(lines: list[str]) -> bool:
 
 def _remove_legacy_numeric_suffix(lines: list[str], header_removed: bool) -> None:
     start = len(lines)
-    while start and (
-        _NUMERIC.fullmatch(lines[start - 1]) or lines[start - 1] == "/"
-    ):
+    while start and (_NUMERIC.fullmatch(lines[start - 1]) or lines[start - 1] == "/"):
         start -= 1
     suffix = lines[start:]
     if not suffix or not lines[:start]:
@@ -102,6 +94,21 @@ def _remove_legacy_numeric_suffix(lines: list[str], header_removed: bool) -> Non
 
 def clean_content_text(value: str, author: str) -> str | None:
     """Remove only trailing Threads chrome while preserving post prose."""
+    # Detached DOM textContent can concatenate the header and toolbar without
+    # separators. Require the exact author header before stripping a packed
+    # toolbar; ordinary prose mentioning likes or follows must remain intact.
+    packed_header = re.match(
+        rf"^\s*追蹤\s*@?{re.escape(author)}\s*(?:原作者說讚\s*)?更多",
+        value,
+    )
+    if packed_header:
+        value = value[packed_header.end() :]
+        value = re.sub(
+            rf"讚\s*(?:{_COUNT})?\s*回覆\s*(?:{_COUNT})?\s*"
+            rf"轉發\s*(?:{_COUNT})?\s*分享\s*(?:{_COUNT})?\s*$",
+            "",
+            value,
+        )
     lines = [line.strip() for line in value.splitlines() if line.strip()]
 
     author_names = {author.casefold(), f"@{author}".casefold()}
