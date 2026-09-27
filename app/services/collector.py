@@ -448,6 +448,7 @@ class ThreadsCollector:
         ]
         page = self._page(f"https://www.threads.com/@{username}{suffix}")
         try:
+            self._save_content_probe(page, username, content_type, "before", cursor)
             for _ in range(8):
                 self._raise_if_rate_limited()
                 page.mouse.wheel(0, 900)
@@ -455,15 +456,47 @@ class ThreadsCollector:
                 self._raise_if_rate_limited()
                 if cursor and page.locator(f'a[href*="/post/{cursor}"]').count():
                     break
-            return self._content_items_from_page(
+            items = self._content_items_from_page(
                 page,
                 username,
                 content_type,
                 limit,
                 cursor=cursor,
             )
+            self._save_content_probe(page, username, content_type, "after", cursor, items)
+            return items
         finally:
             page.close()
+
+    def _save_content_probe(
+        self, page, username, content_type, stage, cursor, items=None
+    ) -> None:
+        """Temporary opt-in, one-shot DOM evidence; never issues network requests."""
+        if username != "sin_9311" or content_type not in {"reply", "repost", "quote"}:
+            return
+        debug_dir = self.settings.media_root.parent / "debug"
+        marker = debug_dir / "content-probe-enabled"
+        target = debug_dir / f"content-probe-{content_type}-{stage}.json"
+        if not marker.exists() or target.exists():
+            return
+        try:
+            snapshot = page.evaluate("""() => {
+                const root = document.querySelector('main') || document.body;
+                const copy = root.cloneNode(true);
+                copy.querySelectorAll('script,style,input,textarea').forEach(e => e.remove());
+                return {url: location.origin + location.pathname,
+                    text: (root.innerText || '').slice(0, 100000),
+                    html: copy.outerHTML.slice(0, 2000000),
+                    links: [...root.querySelectorAll('a[href*="/post/"]')]
+                        .slice(0, 200).map(a => a.getAttribute('href'))};
+            }""")
+            snapshot.update(captured_at=datetime.now(UTC).isoformat(), cursor=cursor,
+                            parsed_ids=[item.threads_id for item in items or []])
+            target.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            page.screenshot(path=str(target.with_suffix(".png")), full_page=False)
+        except Exception:
+            # [DEBUG-content-probe] Evidence capture cannot fail a collection job.
+            return
 
     def collect_content_url(
         self,
