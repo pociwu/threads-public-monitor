@@ -79,6 +79,19 @@ class JobProcessor:
             account = db.get(Account, job.account_id) if job.account_id else None
             if not account or not account.enabled:
                 raise CollectionError("監看帳號已停用或不存在")
+            if (
+                job.kind == "relationship"
+                and job.content_type in RELATIONSHIP_TYPES
+                and self._current_relationship_scan(db, account, job.content_type) is None
+            ):
+                # A profile refresh can make a queued scan unavailable, or
+                # another job can finish it. Do not open the browser or
+                # treat this stale queue entry as a collection failure.
+                job.status = run.status = "succeeded"
+                job.error = None
+                job.finished_at = run.finished_at = now_utc()
+                run.message = "略過過期名單工作：目前沒有執行中的掃描"
+                return
             with ThreadsCollector(self.settings) as collector:
                 if job.kind in {"verify", "profile"}:
                     profile = collector.collect_profile(account.username)
@@ -254,7 +267,8 @@ class JobProcessor:
         scan_date = datetime.now(self.settings.tz).date()
         for relationship_type in RELATIONSHIP_TYPES:
             scan = db.scalar(
-                select(RelationshipScan).where(
+                select(RelationshipScan)
+                .where(
                     RelationshipScan.account_id == account.id,
                     RelationshipScan.relationship_type == relationship_type,
                     RelationshipScan.status == "running",
@@ -337,9 +351,7 @@ class JobProcessor:
             and expected_count != 0
         ):
             label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
-            raise TransientRelationshipError(
-                f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單"
-            )
+            raise TransientRelationshipError(f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單")
         awaiting_removal_confirmation = False
         if batch.complete and batch.observed_usernames is not None:
             removal_fingerprint = self._relationship_removal_fingerprint(
@@ -423,9 +435,7 @@ class JobProcessor:
             and batch.observed_usernames is not None
             and not awaiting_removal_confirmation
         ):
-            observed_usernames = {
-                username.casefold() for username in batch.observed_usernames
-            }
+            observed_usernames = {username.casefold() for username in batch.observed_usernames}
             scan_members = db.execute(
                 select(RelationshipScanMember, RelationshipMember.username)
                 .join(
@@ -448,26 +458,14 @@ class JobProcessor:
             )
             or 0
         )
-        if (
-            batch.complete
-            and scan.collected_count == 0
-            and expected_count != 0
-        ):
+        if batch.complete and scan.collected_count == 0 and expected_count != 0:
             label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
-            raise TransientRelationshipError(
-                f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單"
-            )
+            raise TransientRelationshipError(f"{label}清單尚未載入，拒絕將未知或非空帳號記為空名單")
         if batch.complete and not awaiting_removal_confirmation:
             self._complete_relationship_scan(db, account, scan)
-        if (
-            scan.status == "running"
-            and saved == 0
-            and not awaiting_removal_confirmation
-        ):
+        if scan.status == "running" and saved == 0 and not awaiting_removal_confirmation:
             label = "粉絲" if scan.relationship_type == "followers" else "追蹤中"
-            raise TransientRelationshipError(
-                f"Threads {label}清單本批未取得新成員，已保留目前進度"
-            )
+            raise TransientRelationshipError(f"Threads {label}清單本批未取得新成員，已保留目前進度")
         return saved
 
     @staticmethod
@@ -507,12 +505,11 @@ class JobProcessor:
             return None
         return hashlib.sha256("\n".join(removed).encode()).hexdigest()
 
-    def _activate_following_scan(
-        self, db: Session, account: Account, following_count: int
-    ) -> None:
+    def _activate_following_scan(self, db: Session, account: Account, following_count: int) -> None:
         scan_date = datetime.now(self.settings.tz).date()
         scan = db.scalar(
-            select(RelationshipScan).where(
+            select(RelationshipScan)
+            .where(
                 RelationshipScan.account_id == account.id,
                 RelationshipScan.relationship_type == "following",
                 RelationshipScan.status == "running",
@@ -721,9 +718,7 @@ class JobProcessor:
                 content.reply_to_threads_id = (
                     item.reply_to_threads_id or content.reply_to_threads_id
                 )
-                content.quoted_threads_id = (
-                    item.quoted_threads_id or content.quoted_threads_id
-                )
+                content.quoted_threads_id = item.quoted_threads_id or content.quoted_threads_id
             content.last_seen_at = now_utc()
             content.unavailable_checks = 0
             content.suspected_removed = False
@@ -771,9 +766,7 @@ class JobProcessor:
                     for existing in linked_media_assets
                 ):
                     continue
-                link = ContentMedia(
-                    content_id=content.id, media_id=asset.id, position=position
-                )
+                link = ContentMedia(content_id=content.id, media_id=asset.id, position=position)
                 db.add(link)
                 linked_media_links.append(link)
                 linked_media_assets.append(asset)
@@ -834,8 +827,7 @@ class JobProcessor:
             stream.cursor = items[-1].threads_id if items else stream.cursor
             stream.empty_batches = stream.empty_batches + 1 if new_count == 0 else 0
             if stream.phase == "backfill" and (
-                stream.collected_count >= self.settings.backfill_limit
-                or stream.empty_batches >= 2
+                stream.collected_count >= self.settings.backfill_limit or stream.empty_batches >= 2
             ):
                 stream.phase = "incremental"
 

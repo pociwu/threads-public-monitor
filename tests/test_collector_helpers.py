@@ -74,10 +74,7 @@ def test_parse_labeled_count_falls_back_to_visible_profile_text() -> None:
 def test_parse_retry_after_accepts_delta_seconds_and_http_dates(
     value: str | None, expected: int | None
 ) -> None:
-    assert (
-        parse_retry_after(value, now=datetime(2026, 8, 30, 10, 0, tzinfo=UTC))
-        == expected
-    )
+    assert parse_retry_after(value, now=datetime(2026, 8, 30, 10, 0, tzinfo=UTC)) == expected
 
 
 @pytest.mark.parametrize(
@@ -119,12 +116,8 @@ def test_collector_keeps_longest_retry_after_from_multiple_429_responses(tmp_pat
             browser_profile_dir=tmp_path / "profile",
         )
     )
-    collector._record_rate_limit_response(
-        FakeResponse(status=429, headers={"Retry-After": "60"})
-    )
-    collector._record_rate_limit_response(
-        FakeResponse(status=429, headers={"retry-after": "1800"})
-    )
+    collector._record_rate_limit_response(FakeResponse(status=429, headers={"Retry-After": "60"}))
+    collector._record_rate_limit_response(FakeResponse(status=429, headers={"retry-after": "1800"}))
 
     with pytest.raises(RateLimited) as raised:
         collector._raise_if_rate_limited()
@@ -133,9 +126,7 @@ def test_collector_keeps_longest_retry_after_from_multiple_429_responses(tmp_pat
 
 
 @pytest.mark.parametrize("resource_type", ["image", "media", "font", "stylesheet"])
-def test_collector_ignores_429_from_media_resources(
-    tmp_path, resource_type: str
-) -> None:
+def test_collector_ignores_429_from_media_resources(tmp_path, resource_type: str) -> None:
     collector = ThreadsCollector(
         Settings(
             media_root=tmp_path / "media",
@@ -143,9 +134,7 @@ def test_collector_ignores_429_from_media_resources(
         )
     )
 
-    collector._record_rate_limit_response(
-        FakeResponse(status=429, resource_type=resource_type)
-    )
+    collector._record_rate_limit_response(FakeResponse(status=429, resource_type=resource_type))
 
     collector._raise_if_rate_limited()
 
@@ -378,7 +367,7 @@ def test_empty_relationship_diagnostic_keeps_bounded_latest_artifacts(tmp_path) 
             return {
                 "url": "https://www.threads.com/@example",
                 "title": "Threads",
-                "dialogHtml": "<div role=\"dialog\">changed DOM</div>",
+                "dialogHtml": '<div role="dialog">changed DOM</div>',
                 "dialogLinks": [],
                 "dialogControls": [],
                 "dialogImages": [],
@@ -437,8 +426,7 @@ def test_positive_follower_count_waits_for_an_active_relationship_row(tmp_path) 
     collector._wait_for_relationship_rows(page, expected_count=51)
 
     assert page.selector == (
-        '[role="dialog"]:visible a[href*="/@"], '
-        '[aria-modal="true"]:visible a[href*="/@"]'
+        '[role="dialog"]:visible a[href*="/@"], [aria-modal="true"]:visible a[href*="/@"]'
     )
 
 
@@ -506,12 +494,18 @@ def test_relationship_helpers_target_active_dialog_and_correct_list_name() -> No
     assert ThreadsCollector._relationship_timeout_message("following") == (
         "Threads 追蹤中清單載入逾時，未取得任何成員"
     )
-    assert ThreadsCollector._effective_relationship_count(
-        "followers", {"followers": "粉絲 0", "following": "追蹤中 149"}, 51
-    ) == 0
-    assert ThreadsCollector._effective_relationship_count(
-        "following", {"followers": "粉絲 51", "following": None}, 149
-    ) == 149
+    assert (
+        ThreadsCollector._effective_relationship_count(
+            "followers", {"followers": "粉絲 0", "following": "追蹤中 149"}, 51
+        )
+        == 0
+    )
+    assert (
+        ThreadsCollector._effective_relationship_count(
+            "following", {"followers": "粉絲 51", "following": None}, 149
+        )
+        == 149
+    )
 
 
 def test_relationship_row_wait_survives_one_transient_timeout(tmp_path) -> None:
@@ -678,10 +672,8 @@ def test_missing_relationship_control_is_retryable_and_saves_diagnostic(tmp_path
     page = FakePage()
     diagnostics = []
     collector._page = lambda _url: page
-    collector._save_relationship_diagnostic = (
-        lambda _page, username, relationship_type: diagnostics.append(
-            (username, relationship_type)
-        )
+    collector._save_relationship_diagnostic = lambda _page, username, relationship_type, **_kwargs: (
+        diagnostics.append((username, relationship_type))
     )
 
     with pytest.raises(TransientRelationshipError, match="清單控制項"):
@@ -728,10 +720,8 @@ def test_relationship_dialog_rerender_is_retryable_and_saves_diagnostic(tmp_path
     collector._scan_relationship_dialog = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         PlaywrightTimeoutError("dialog was detached during rerender")
     )
-    collector._save_relationship_diagnostic = (
-        lambda _page, username, relationship_type: diagnostics.append(
-            (username, relationship_type)
-        )
+    collector._save_relationship_diagnostic = lambda _page, username, relationship_type, **_kwargs: (
+        diagnostics.append((username, relationship_type))
     )
 
     with pytest.raises(TransientRelationshipError, match="掃描中斷"):
@@ -742,22 +732,28 @@ def test_relationship_dialog_rerender_is_retryable_and_saves_diagnostic(tmp_path
 
 
 def test_relationship_batch_only_completes_on_explicit_scanner_decision() -> None:
-    assert ThreadsCollector._relationship_batch_complete(
-        {
-            "complete": True,
-            "atEnd": True,
-            "stagnant": 8,
-            "orderedCount": 122,
-        }
-    ) is True
-    assert ThreadsCollector._relationship_batch_complete(
-        {
-            "complete": False,
-            "atEnd": True,
-            "stagnant": 8,
-            "orderedCount": 122,
-        }
-    ) is False
+    assert (
+        ThreadsCollector._relationship_batch_complete(
+            {
+                "complete": True,
+                "atEnd": True,
+                "stagnant": 8,
+                "orderedCount": 122,
+            }
+        )
+        is True
+    )
+    assert (
+        ThreadsCollector._relationship_batch_complete(
+            {
+                "complete": False,
+                "atEnd": True,
+                "stagnant": 8,
+                "orderedCount": 122,
+            }
+        )
+        is False
+    )
 
 
 def test_relationship_dialog_accumulates_virtualized_rows_across_scrolls(
@@ -1046,9 +1042,7 @@ def test_relationship_dialog_stops_before_another_scroll_after_429(tmp_path) -> 
     assert page.waits == []
 
 
-def test_relationship_dialog_stops_on_in_page_rate_limit_message(
-    tmp_path, monkeypatch
-) -> None:
+def test_relationship_dialog_stops_on_in_page_rate_limit_message(tmp_path, monkeypatch) -> None:
     class FakeDialog:
         def __init__(self):
             self.calls = 0
@@ -1280,9 +1274,7 @@ def test_interaction_counts_use_numbers_next_to_icon_controls() -> None:
 
 
 def test_interaction_counts_fall_back_to_inline_metric_summary() -> None:
-    assert ThreadsCollector._button_counts(
-        [], "貼文正文\n讚3.2 萬回覆256轉發1,725分享3,229"
-    ) == {
+    assert ThreadsCollector._button_counts([], "貼文正文\n讚3.2 萬回覆256轉發1,725分享3,229") == {
         "like_count": 32000,
         "reply_count": 256,
         "repost_count": 1725,

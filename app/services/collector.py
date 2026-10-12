@@ -32,9 +32,7 @@ from app.services.content_text import clean_content_text
 
 COUNT_RE = re.compile(r"([\d,.]+)\s*([萬万千KkMm]?)")
 POST_ID_RE = re.compile(r"/post/([^/?#]+)")
-ACTIVE_RELATIONSHIP_DIALOG_SELECTOR = (
-    '[role="dialog"]:visible, [aria-modal="true"]:visible'
-)
+ACTIVE_RELATIONSHIP_DIALOG_SELECTOR = '[role="dialog"]:visible, [aria-modal="true"]:visible'
 RATE_LIMIT_RESOURCE_TYPES = frozenset({"document", "xhr", "fetch"})
 META_UI_HOST_SUFFIXES = ("threads.com", "threads.net", "instagram.com", "facebook.com")
 RELATIONSHIP_SCROLL_MIN_DELAY_MS = 750
@@ -146,9 +144,7 @@ def parse_labeled_count(
     return None
 
 
-def parse_retry_after(
-    value: str | None, *, now: datetime | None = None
-) -> int | None:
+def parse_retry_after(value: str | None, *, now: datetime | None = None) -> int | None:
     """Parse an HTTP Retry-After delta or date into a non-negative delay."""
     if not value:
         return None
@@ -411,8 +407,7 @@ class ThreadsCollector:
     def _profile_matches_username(raw: dict[str, Any], username: str) -> bool:
         expected = f"/@{username}".casefold().rstrip("/")
         has_identity_path = any(
-            str(path).casefold().rstrip("/") == expected
-            for path in raw.get("profilePaths", [])
+            str(path).casefold().rstrip("/") == expected for path in raw.get("profilePaths", [])
         )
         has_profile_control = bool(raw.get("followerText")) or any(
             str(path).casefold().rstrip("/") == expected
@@ -674,10 +669,10 @@ class ThreadsCollector:
                     }""",
                 )
             if not opened:
-                self._save_relationship_diagnostic(page, username, relationship_type)
-                raise TransientRelationshipError(
-                    "Threads 目前未提供可存取的粉絲／追蹤中清單控制項"
+                self._save_relationship_diagnostic(
+                    page, username, relationship_type, stage="open_control_missing"
                 )
+                raise TransientRelationshipError("Threads 目前未提供可存取的粉絲／追蹤中清單控制項")
             page.wait_for_timeout(1000)
             self._raise_if_rate_limited()
             dialog = self._active_relationship_dialog(page)
@@ -686,7 +681,9 @@ class ThreadsCollector:
                 self._raise_if_rate_limited()
             except PlaywrightTimeoutError as exc:
                 self._raise_if_rate_limited()
-                self._save_relationship_diagnostic(page, username, relationship_type)
+                self._save_relationship_diagnostic(
+                    page, username, relationship_type, stage="dialog_visibility_timeout"
+                )
                 raise TransientRelationshipError(
                     self._relationship_timeout_message(relationship_type)
                 ) from exc
@@ -710,7 +707,9 @@ class ThreadsCollector:
             try:
                 self._wait_for_relationship_rows(page, effective_expected_count)
             except PlaywrightTimeoutError as exc:
-                self._save_relationship_diagnostic(page, username, relationship_type)
+                self._save_relationship_diagnostic(
+                    page, username, relationship_type, stage="member_rows_timeout"
+                )
                 raise TransientRelationshipError(
                     self._relationship_timeout_message(relationship_type)
                 ) from exc
@@ -726,7 +725,9 @@ class ThreadsCollector:
                 )
             except PlaywrightError as exc:
                 self._raise_if_rate_limited()
-                self._save_relationship_diagnostic(page, username, relationship_type)
+                self._save_relationship_diagnostic(
+                    page, username, relationship_type, stage="dialog_scan_interrupted"
+                )
                 raise TransientRelationshipError(
                     "Threads 關係名單掃描中斷，已保留目前進度"
                 ) from exc
@@ -922,12 +923,8 @@ class ThreadsCollector:
                     }
                     added += 1
                 else:
-                    existing["displayName"] = (
-                        item.get("displayName") or existing.get("displayName")
-                    )
-                    existing["avatarUrl"] = (
-                        item.get("avatarUrl") or existing.get("avatarUrl")
-                    )
+                    existing["displayName"] = item.get("displayName") or existing.get("displayName")
+                    existing["avatarUrl"] = item.get("avatarUrl") or existing.get("avatarUrl")
 
             members = [
                 member
@@ -979,25 +976,18 @@ class ThreadsCollector:
 
             has_rows = bool(ordered)
             known_empty = expected_count == 0
-            count_reached = (
-                expected_count is not None and len(ordered) >= expected_count
-            )
+            count_reached = expected_count is not None and len(ordered) >= expected_count
             stable_requirement_ms = (
                 RELATIONSHIP_END_STABLE_MS
                 if bool(snapshot.get("scrollable", True)) or count_reached
                 else RELATIONSHIP_NON_SCROLLABLE_END_STABLE_MS
             )
-            if (
-                stable_end_ms >= stable_requirement_ms
-                and (has_rows or known_empty)
-            ):
+            if stable_end_ms >= stable_requirement_ms and (has_rows or known_empty):
                 return {
                     **common,
                     "members": members[:limit],
                     "complete": True,
-                    "observedUsernames": [
-                        member["username"] for member in ordered.values()
-                    ],
+                    "observedUsernames": [member["username"] for member in ordered.values()],
                     "stagnant": stagnant,
                     "stableEndMs": stable_end_ms,
                     "terminationReason": "accessible_end",
@@ -1033,9 +1023,11 @@ class ThreadsCollector:
 
     @staticmethod
     def _active_relationship_dialog(page: Page) -> Locator:
-        return page.locator(ACTIVE_RELATIONSHIP_DIALOG_SELECTOR).filter(
-            has_text=re.compile(r"粉絲|followers?|追蹤中|following", re.I)
-        ).first
+        return (
+            page.locator(ACTIVE_RELATIONSHIP_DIALOG_SELECTOR)
+            .filter(has_text=re.compile(r"粉絲|followers?|追蹤中|following", re.I))
+            .first
+        )
 
     @staticmethod
     def _relationship_timeout_message(relationship_type: str) -> str:
@@ -1051,14 +1043,11 @@ class ThreadsCollector:
         current = parse_count(relationship_counts.get(relationship_type))
         return current if current is not None else fallback
 
-    def _wait_for_relationship_rows(
-        self, page: Page, expected_count: int | None
-    ) -> None:
+    def _wait_for_relationship_rows(self, page: Page, expected_count: int | None) -> None:
         if expected_count is not None and expected_count <= 0:
             return
         rows = page.locator(
-            '[role="dialog"]:visible a[href*="/@"], '
-            '[aria-modal="true"]:visible a[href*="/@"]'
+            '[role="dialog"]:visible a[href*="/@"], [aria-modal="true"]:visible a[href*="/@"]'
         ).first
         for attempt, timeout in enumerate((30_000, 20_000)):
             self._raise_if_rate_limited()
@@ -1076,13 +1065,21 @@ class ThreadsCollector:
                 self._raise_if_rate_limited()
 
     def _save_relationship_diagnostic(
-        self, page: Page, username: str, relationship_type: str
+        self,
+        page: Page,
+        username: str,
+        relationship_type: str,
+        *,
+        stage: str = "scan_no_progress",
     ) -> None:
-        """Keep one bounded diagnostic artifact when Threads renders no member rows."""
+        """Keep bounded failure evidence separately from routine no-progress evidence."""
         safe_username = re.sub(r"[^a-zA-Z0-9._-]", "_", username)
         debug_dir = self.settings.media_root.parent / "debug"
-        json_path = debug_dir / f"relationship-{safe_username}-{relationship_type}-latest.json"
-        png_path = debug_dir / f"relationship-{safe_username}-{relationship_type}-latest.png"
+        # Keep the last failure separately from a later, non-failing no-progress
+        # snapshot so the evidence for a timeout is not silently overwritten.
+        suffix = "latest" if stage == "scan_no_progress" else "failure-latest"
+        json_path = debug_dir / f"relationship-{safe_username}-{relationship_type}-{suffix}.json"
+        png_path = json_path.with_suffix(".png")
         try:
             debug_dir.mkdir(parents=True, exist_ok=True)
             snapshot = page.evaluate(
@@ -1129,6 +1126,7 @@ class ThreadsCollector:
             snapshot["capturedAt"] = datetime.now(UTC).isoformat(timespec="seconds")
             snapshot["username"] = username
             snapshot["relationshipType"] = relationship_type
+            snapshot["failureStage"] = stage
             json_path.write_text(
                 json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
             )

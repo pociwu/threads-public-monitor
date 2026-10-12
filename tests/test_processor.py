@@ -268,9 +268,7 @@ def test_relationship_avatar_checkpoint_releases_sqlite_lock_before_http_io(
         db.add(scan)
         db.commit()
 
-        with patch(
-            "app.services.media.httpx.stream", return_value=ConcurrentWriteStream()
-        ):
+        with patch("app.services.media.httpx.stream", return_value=ConcurrentWriteStream()):
             JobProcessor(settings)._save_relationship_batch(
                 db,
                 account,
@@ -599,9 +597,7 @@ def test_content_batch_links_canonical_media_only_once_for_duplicate_bytes(tmp_p
 
         content = db.scalar(select(Content).where(Content.threads_id == "duplicate-media"))
         assert content is not None
-        links = db.scalars(
-            select(ContentMedia).where(ContentMedia.content_id == content.id)
-        ).all()
+        links = db.scalars(select(ContentMedia).where(ContentMedia.content_id == content.id)).all()
         assert len(links) == 1
 
 
@@ -623,13 +619,9 @@ def test_content_batch_prefers_full_size_instagram_variant(tmp_path) -> None:
             return asset
 
     thumbnail = (
-        "https://scontent.cdninstagram.com/v/t51/same_n.jpg"
-        "?stp=dst-jpg_p240x240&ig_cache_key=SAME"
+        "https://scontent.cdninstagram.com/v/t51/same_n.jpg?stp=dst-jpg_p240x240&ig_cache_key=SAME"
     )
-    full_size = (
-        "https://scontent.cdninstagram.com/v/t51/same_n.jpg"
-        "?stp=dst-jpg&ig_cache_key=SAME"
-    )
+    full_size = "https://scontent.cdninstagram.com/v/t51/same_n.jpg?stp=dst-jpg&ig_cache_key=SAME"
     settings = Settings(
         database_url="sqlite:///:memory:",
         media_root=tmp_path / "media",
@@ -796,9 +788,7 @@ def test_relationship_scans_create_baseline_then_daily_added_removed_diff(tmp_pa
         )
         db.add(first)
         db.flush()
-        processor._save_relationship_batch(
-            db, account, first, relationship_batch("alice", "bob")
-        )
+        processor._save_relationship_batch(db, account, first, relationship_batch("alice", "bob"))
         db.flush()
 
         assert first.status == "complete"
@@ -812,15 +802,12 @@ def test_relationship_scans_create_baseline_then_daily_added_removed_diff(tmp_pa
         )
         db.add(second)
         db.flush()
-        processor._save_relationship_batch(
-            db, account, second, relationship_batch("bob", "carol")
-        )
+        processor._save_relationship_batch(db, account, second, relationship_batch("bob", "carol"))
         db.flush()
 
         changes = db.scalars(select(RelationshipChange).order_by(RelationshipChange.id)).all()
         members = {
-            member.username: member
-            for member in db.scalars(select(RelationshipMember)).all()
+            member.username: member for member in db.scalars(select(RelationshipMember)).all()
         }
         assert [(change.change_type, change.member.username) for change in changes] == [
             ("added", "carol"),
@@ -962,11 +949,14 @@ def test_relationship_removal_candidate_disappearing_on_second_pass_is_not_emitt
 
         assert current.status == "running"
         assert current.removal_confirmation_fingerprint is not None
-        assert db.scalar(
-            select(func.count(RelationshipChange.id)).where(
-                RelationshipChange.scan_id == current.id
+        assert (
+            db.scalar(
+                select(func.count(RelationshipChange.id)).where(
+                    RelationshipChange.scan_id == current.id
+                )
             )
-        ) == 0
+            == 0
+        )
 
         processor._save_relationship_batch(
             db,
@@ -978,11 +968,14 @@ def test_relationship_removal_candidate_disappearing_on_second_pass_is_not_emitt
 
         assert current.status == "complete"
         assert current.removal_confirmation_fingerprint is None
-        assert db.scalar(
-            select(func.count(RelationshipChange.id)).where(
-                RelationshipChange.scan_id == current.id
+        assert (
+            db.scalar(
+                select(func.count(RelationshipChange.id)).where(
+                    RelationshipChange.scan_id == current.id
+                )
             )
-        ) == 0
+            == 0
+        )
 
 
 def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> None:
@@ -993,9 +986,7 @@ def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> 
     )
     processor = JobProcessor(settings)
     with make_session() as db:
-        account = Account(
-            username="example", status="active", follower_count=51
-        )
+        account = Account(username="example", status="active", follower_count=51)
         db.add(account)
         db.flush()
         scan = RelationshipScan(
@@ -1008,9 +999,7 @@ def test_nonempty_follower_profile_cannot_complete_with_empty_scan(tmp_path) -> 
         db.flush()
 
         with pytest.raises(TransientRelationshipError, match="粉絲清單尚未載入"):
-            processor._save_relationship_batch(
-                db, account, scan, relationship_batch(complete=True)
-            )
+            processor._save_relationship_batch(db, account, scan, relationship_batch(complete=True))
 
         assert scan.status == "running"
         assert scan.collected_count == 0
@@ -1087,9 +1076,7 @@ def test_unknown_relationship_total_cannot_complete_as_empty(tmp_path) -> None:
         db.flush()
 
         with pytest.raises(TransientRelationshipError, match="粉絲清單尚未載入"):
-            processor._save_relationship_batch(
-                db, account, scan, relationship_batch(complete=True)
-            )
+            processor._save_relationship_batch(db, account, scan, relationship_batch(complete=True))
 
         assert scan.status == "running"
 
@@ -1114,9 +1101,7 @@ def test_known_zero_relationship_total_can_complete_as_empty(tmp_path) -> None:
         db.add(scan)
         db.flush()
 
-        processor._save_relationship_batch(
-            db, account, scan, relationship_batch(complete=True)
-        )
+        processor._save_relationship_batch(db, account, scan, relationship_batch(complete=True))
 
         assert scan.status == "complete"
         assert scan.collected_count == 0
@@ -1588,6 +1573,78 @@ def test_following_zero_completes_new_scan_and_records_removed_members(tmp_path)
         assert member.active is False
         assert member.removed_at is not None
         assert change is not None
+
+
+@pytest.mark.parametrize("scan_status", ["complete", "unavailable", "failed", None])
+def test_stale_relationship_job_is_skipped_without_browser(tmp_path, scan_status):
+    settings = Settings(media_root=tmp_path / "media")
+    with make_session() as db:
+        cooldown = datetime(2026, 10, 13)
+        account = Account(
+            username="example", status="cooldown", consecutive_failures=2, cooldown_until=cooldown
+        )
+        db.add(account)
+        db.flush()
+        if scan_status:
+            db.add(
+                RelationshipScan(
+                    account_id=account.id,
+                    relationship_type="following",
+                    scan_date=date(2026, 10, 12),
+                    status=scan_status,
+                )
+            )
+        job = Job(
+            account_id=account.id, kind="relationship", content_type="following", status="running"
+        )
+        db.add(job)
+        db.commit()
+        with patch("app.services.processor.ThreadsCollector") as collector:
+            JobProcessor(settings).process(db, job)
+        assert job.status == "succeeded"
+        assert account.status == "cooldown"
+        assert account.consecutive_failures == 2
+        assert account.cooldown_until == cooldown
+        assert job.finished_at is not None
+        collector.assert_not_called()
+        run = db.scalar(select(CollectionRun))
+        assert run.message and "略過" in run.message
+        assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+
+
+def test_queued_relationship_job_survives_scan_becoming_unavailable(tmp_path):
+    settings = Settings(media_root=tmp_path / "media")
+    processor = JobProcessor(settings)
+    with make_session() as db:
+        account = Account(username="example", status="active", following_count=10)
+        db.add(account)
+        db.flush()
+        scan = RelationshipScan(
+            account_id=account.id,
+            relationship_type="following",
+            scan_date=datetime.now(settings.tz).date(),
+            status="running",
+            collected_count=5,
+            cursor="saved_cursor",
+        )
+        job = Job(
+            account_id=account.id, kind="relationship", content_type="following", status="queued"
+        )
+        db.add_all([scan, job])
+        db.commit()
+        account.following_count = None
+        processor._schedule_relationship_scans(db, account)
+        db.commit()
+        assert scan.status == "unavailable"
+        job.status = "running"
+        with patch("app.services.processor.ThreadsCollector") as collector:
+            processor.process(db, job)
+        assert job.status == "succeeded"
+        assert scan.status == "unavailable"
+        assert scan.collected_count == 5
+        assert scan.cursor == "saved_cursor"
+        collector.assert_not_called()
+        assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
 
 
 def test_relationship_failure_does_not_mark_account_error(tmp_path) -> None:
