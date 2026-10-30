@@ -1612,7 +1612,7 @@ def test_stale_relationship_job_is_skipped_without_browser(tmp_path, scan_status
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
 
 
-@pytest.mark.parametrize("terminal_status", ["complete", "failed"])
+@pytest.mark.parametrize("terminal_status", ["complete", "failed", "invalid"])
 def test_missing_profile_count_preserves_terminal_following_scan(tmp_path, terminal_status):
     settings = Settings(media_root=tmp_path / "media")
     with make_session() as db:

@@ -295,7 +295,7 @@ class JobProcessor:
                 db.flush()
             # A missing profile statistic is not evidence that a completed
             # snapshot disappeared. Keep terminal scans as comparison baselines.
-            if scan.status in {"complete", "failed"}:
+            if scan.status in {"complete", "failed", "invalid"}:
                 continue
             if relationship_type == "following" and account.following_count is None:
                 scan.status = "unavailable"
@@ -538,7 +538,7 @@ class JobProcessor:
             )
             db.add(scan)
             db.flush()
-        if scan.status == "failed":
+        if scan.status in {"failed", "invalid"}:
             return
         elif following_count > 0 and scan.status == "unavailable":
             scan.status = "running"
