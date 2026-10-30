@@ -293,6 +293,10 @@ class JobProcessor:
                 )
                 db.add(scan)
                 db.flush()
+            # A missing profile statistic is not evidence that a completed
+            # snapshot disappeared. Keep terminal scans as comparison baselines.
+            if scan.status in {"complete", "failed"}:
+                continue
             if relationship_type == "following" and account.following_count is None:
                 scan.status = "unavailable"
                 scan.completed_at = now_utc()

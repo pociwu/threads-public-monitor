@@ -685,6 +685,53 @@ def test_missing_relationship_control_is_retryable_and_saves_diagnostic(tmp_path
     assert page.closed is True
 
 
+def test_following_rejects_dialog_still_showing_followers(tmp_path):
+    class SelectedTab:
+        def filter(self, **kwargs):
+            return self
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, **kwargs):
+            raise PlaywrightTimeoutError("followers remains selected")
+
+    class Dialog:
+        def wait_for(self, **kwargs):
+            pass
+
+        def locator(self, selector):
+            assert 'aria-selected="true"' in selector
+            return SelectedTab()
+
+        def evaluate(self, script):
+            return {"followers": "粉絲 53", "following": "追蹤中 151"}
+
+    class Page:
+        def wait_for_timeout(self, ms):
+            pass
+
+        def close(self):
+            pass
+
+    collector = ThreadsCollector(Settings(media_root=tmp_path / "media"))
+    collector._page = lambda url: Page()
+    collector._click_when_available = lambda *args, **kwargs: True
+    collector._active_relationship_dialog = lambda page: Dialog()
+    collector._wait_for_relationship_rows = lambda *args: None
+    scans = []
+    collector._scan_relationship_dialog = lambda *args, **kwargs: scans.append(True) or {
+        "members": [], "complete": True, "available": True
+    }
+    stages = []
+    collector._save_relationship_diagnostic = lambda *args, **kwargs: stages.append(kwargs.get("stage"))
+    with pytest.raises(TransientRelationshipError, match="分頁未確認切換成功"):
+        collector.collect_relationships("example", "following")
+    assert scans == []
+    assert stages == ["relationship_tab_mismatch"]
+
+
 def test_relationship_dialog_rerender_is_retryable_and_saves_diagnostic(tmp_path) -> None:
     class FakeDialog:
         def wait_for(self, *, state, timeout):

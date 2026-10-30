@@ -682,7 +682,9 @@ def account_detail(
     if tab == "changes":
         relationship_changes = db.scalars(
             select(RelationshipChange)
+            .join(RelationshipScan, RelationshipScan.id == RelationshipChange.scan_id)
             .where(RelationshipChange.account_id == account.id)
+            .where(RelationshipScan.status != "invalid")
             .options(selectinload(RelationshipChange.member).selectinload(RelationshipMember.avatar))
             .order_by(
                 RelationshipChange.observed_date.desc(), RelationshipChange.id.desc()

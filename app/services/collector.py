@@ -657,9 +657,11 @@ class ThreadsCollector:
                           /粉絲|followers?|追蹤中|following/i.test(element.innerText || '');
                       });
                       if (!dialog) return false;
+                      // The tab wrapper may have no click handler; the nested
+                      // button is the actual interactive control.
                       const controls = [...dialog.querySelectorAll(
-                        'a,button,[role="button"],[role="tab"]'
-                      )];
+                        'a,button,[role="button"]'
+                      ), ...dialog.querySelectorAll('[role="tab"]')];
                       const target = controls.find(el => /追蹤中|following/i.test(
                         [el.getAttribute('aria-label') || '', el.textContent || ''].join(' ')
                       ));
@@ -687,6 +689,20 @@ class ThreadsCollector:
                 raise TransientRelationshipError(
                     self._relationship_timeout_message(relationship_type)
                 ) from exc
+            if relationship_type == "following":
+                try:
+                    dialog.locator('[role="tab"][aria-selected="true"]').filter(
+                        has_text=re.compile(r"^\s*(?:追蹤中|following)(?:\s|\d|$)", re.I)
+                    ).first.wait_for(state="visible", timeout=10_000)
+                    self._raise_if_rate_limited()
+                except PlaywrightTimeoutError as exc:
+                    self._raise_if_rate_limited()
+                    self._save_relationship_diagnostic(
+                        page, username, relationship_type, stage="relationship_tab_mismatch"
+                    )
+                    raise TransientRelationshipError(
+                        "Threads 追蹤中分頁未確認切換成功，拒絕將粉絲名單當成追蹤中名單"
+                    ) from exc
             relationship_counts: dict[str, str | None] = dialog.evaluate(
                 r"""dialog => {
                   const labels = [...dialog.querySelectorAll('a,button,[role="button"]')]

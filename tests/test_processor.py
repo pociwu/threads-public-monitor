@@ -1612,6 +1612,26 @@ def test_stale_relationship_job_is_skipped_without_browser(tmp_path, scan_status
         assert db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
 
 
+@pytest.mark.parametrize("terminal_status", ["complete", "failed"])
+def test_missing_profile_count_preserves_terminal_following_scan(tmp_path, terminal_status):
+    settings = Settings(media_root=tmp_path / "media")
+    with make_session() as db:
+        account = Account(username="example", status="active", following_count=None)
+        db.add(account)
+        db.flush()
+        completed = datetime(2026, 10, 29, 1, 0)
+        scan = RelationshipScan(
+            account_id=account.id, relationship_type="following",
+            scan_date=datetime.now(settings.tz).date(), status=terminal_status,
+            collected_count=53, completed_at=completed,
+        )
+        db.add(scan)
+        db.commit()
+        JobProcessor(settings)._schedule_relationship_scans(db, account)
+        assert scan.status == terminal_status
+        assert scan.completed_at == completed
+
+
 def test_queued_relationship_job_survives_scan_becoming_unavailable(tmp_path):
     settings = Settings(media_root=tmp_path / "media")
     processor = JobProcessor(settings)
