@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fluxbox \
     fonts-noto-cjk \
+    libatomic1 \
     novnc \
     sqlite3 \
     tini \

@@ -176,6 +176,41 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def embedded_post_videos(scripts: list[str], post_code: str) -> list[tuple[str, str]]:
+    """Resolve blob-backed video from the matching post's loaded JSON only."""
+    result: list[tuple[str, str]] = []
+    for script in scripts:
+        try:
+            pending = [json.loads(script)]
+        except (ValueError, TypeError):
+            continue
+        while pending:
+            node = pending.pop()
+            if isinstance(node, list):
+                pending.extend(node)
+            elif isinstance(node, dict):
+                if node.get("code") == post_code:
+                    attachments = [node, *(node.get("carousel_media") or [])]
+                    for attachment in attachments:
+                        if not isinstance(attachment, dict):
+                            continue
+                        for variant in attachment.get("video_versions") or []:
+                            if not isinstance(variant, dict):
+                                continue
+                            url = variant.get("url")
+                            if not isinstance(url, str):
+                                continue
+                            parsed = urlparse(url)
+                            if parsed.scheme in {"http", "https"} and parsed.hostname:
+                                candidate = (url, "video")
+                                if candidate not in result:
+                                    result.append(candidate)
+                                break
+                else:
+                    pending.extend(node.values())
+    return result
+
+
 class ThreadsCollector:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -577,6 +612,7 @@ class ThreadsCollector:
             )
             raw_items = raw_items[cursor_index + 1 :] if cursor_index >= 0 else []
         items: list[ContentData] = []
+        embedded_scripts = None
         for raw in raw_items:
             post_match = POST_ID_RE.search(raw.get("href", ""))
             if not post_match:
@@ -596,6 +632,14 @@ class ThreadsCollector:
             counts = self._button_counts(raw.get("buttons", []), raw.get("text", ""))
             cleaned_text = self._clean_content_text(raw.get("text", ""), author)
             media = [(m["url"], m["type"]) for m in raw.get("media", []) if m.get("url")]
+            if any(url.startswith("blob:") and kind == "video" for url, kind in media):
+                if embedded_scripts is None:
+                    embedded_scripts = page.locator(
+                        'script[type="application/json"]'
+                    ).all_text_contents()
+                videos = embedded_post_videos(embedded_scripts, post_match.group(1))
+                media = [(url, kind) for url, kind in media if not url.startswith("blob:")]
+                media.extend(videos)
             items.append(
                 ContentData(
                     threads_id=post_match.group(1),
