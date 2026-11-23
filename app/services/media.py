@@ -46,6 +46,11 @@ def deduplicate_media_candidates(
     positions: dict[tuple[str, str], int] = {}
     for candidate in candidates:
         url, media_type = candidate
+        # Browser object URLs change on every visit and cannot be downloaded
+        # by the HTTP client. Never persist them as new attachments.
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            continue
         canonical = canonical_media_key(url)
         if canonical is None:
             result.append(candidate)

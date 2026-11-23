@@ -18,6 +18,14 @@ from app.services.media import (
 )
 
 
+def test_browser_blob_urls_do_not_accumulate_as_media_candidates():
+    cover = ("https://cdn.example.com/cover.jpg", "image")
+    for visit in range(61):
+        assert deduplicate_media_candidates([
+            cover, (f"blob:https://www.threads.com/visit-{visit}", "video")
+        ]) == [cover]
+
+
 def test_media_download_does_not_commit_callers_unit_of_work(tmp_path) -> None:
     database_path = tmp_path / "media-transaction.db"
     engine = create_engine(
